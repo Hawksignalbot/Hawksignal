@@ -3,5 +3,5 @@ requests==2.31.0
 gunicorn==21.2.0
 yfinance==0.2.38
 pandas==2.2.3
-pandas-ta==0.3.14b
+pandas-ta==0.4.67b0
 
