@@ -1,12 +1,31 @@
 import os
-import json
+import time
 import requests
-from flask import Flask, request, jsonify
+import threading
+from flask import Flask, jsonify
+from datetime import datetime
+import yfinance as yf
+import pandas as pd
+import pandas_ta as ta
 
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+
+# NASDAQ'tan en aktif 80 hisse
+WATCHLIST = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AMD",
+    "AVGO", "QCOM", "INTC", "MU", "AMAT", "KLAC", "LRCX", "MRVL",
+    "ORCL", "CRM", "NOW", "SNOW", "PLTR", "DDOG", "NET", "CRWD",
+    "ZS", "PANW", "OKTA", "MDB", "ABNB", "UBER", "LYFT", "DASH",
+    "SHOP", "SPOT", "NFLX", "DIS", "ROKU", "TTD", "TRADE", "APPS",
+    "PYPL", "SQ", "COIN", "HOOD", "SOFI", "AFRM", "UPST", "LC",
+    "MRNA", "BNTX", "PFE", "GILD", "BIIB", "REGN", "VRTX", "ILMN",
+    "ENPH", "FSLR", "SEDG", "RUN", "PLUG", "BE", "CHPT", "BLNK",
+    "RIVN", "LCID", "NIO", "LI", "XPEV", "FSR", "WKHS", "GOEV",
+    "RBLX", "U", "MTTR", "ASGN", "IONQ", "QUBT", "RGTI", "ARQQ"
+]
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -15,26 +34,157 @@ def send_telegram(message):
         "text": message,
         "parse_mode": "HTML"
     }
-    requests.post(url, json=payload)
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except:
+        pass
 
-def analyze_signal(data):
-    ticker = data.get("ticker", "UNKNOWN")
-    close = float(data.get("close", 0))
-    rsi = float(data.get("rsi", 0))
-    macd = float(data.get("macd", 0))
-    macd_signal = float(data.get("macd_signal", 0))
-    volume = float(data.get("volume", 0))
-    avg_volume = float(data.get("avg_volume", 1))
-    ema20 = float(data.get("ema20", 0))
-    action = data.get("action", "").upper()
+def analyze_stock(ticker):
+    try:
+        df = yf.download(ticker, period="60d", interval="1h", progress=False)
+        if df is None or len(df) < 50:
+            return None
 
-    score = 0
-    reasons = []
-    warnings = []
+        # Göstergeleri hesapla
+        df['RSI'] = ta.rsi(df['Close'], length=14)
+        macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
+        df['MACD'] = macd['MACD_12_26_9']
+        df['MACD_Signal'] = macd['MACDs_12_26_9']
+        df['EMA20'] = ta.ema(df['Close'], length=20)
+        df['Vol_MA'] = df['Volume'].rolling(20).mean()
 
-    # RSI Analizi
-    if action == "BUY":
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        rsi = float(last['RSI'])
+        macd_val = float(last['MACD'])
+        macd_sig = float(last['MACD_Signal'])
+        macd_prev = float(prev['MACD'])
+        macd_sig_prev = float(prev['MACD_Signal'])
+        close = float(last['Close'])
+        ema20 = float(last['EMA20'])
+        volume = float(last['Volume'])
+        avg_volume = float(last['Vol_MA'])
+
+        score = 0
+        reasons = []
+        action = None
+
+        # ALIM sinyali kriterleri
+        buy_score = 0
         if 50 <= rsi <= 65:
+            buy_score += 2
+            reasons.append(f"✅ RSI: {rsi:.1f} (ideal)")
+        elif 45 <= rsi < 50:
+            buy_score += 1
+            reasons.append(f"✅ RSI: {rsi:.1f} (toparlanıyor)")
+
+        # MACD crossover (önceki bar altında, şimdi üstünde)
+        if macd_prev < macd_sig_prev and macd_val > macd_sig:
+            buy_score += 3
+            reasons.append(f"✅ MACD: Taze crossover! 🔥")
+        elif macd_val > macd_sig:
+            buy_score += 1
+            reasons.append(f"✅ MACD: Pozitif")
+
+        if close > ema20:
+            buy_score += 2
+            reasons.append(f"✅ EMA20 üstünde")
+
+        vol_ratio = volume / avg_volume if avg_volume > 0 else 0
+        if vol_ratio >= 2.0:
+            buy_score += 2
+            reasons.append(f"✅ Hacim: {vol_ratio:.1f}x 🔥")
+        elif vol_ratio >= 1.5:
+            buy_score += 1
+            reasons.append(f"✅ Hacim: {vol_ratio:.1f}x")
+
+        if buy_score >= 6:
+            action = "BUY"
+            score = buy_score
+
+        if action == "BUY":
+            entry = close
+            stop = round(entry * 0.98, 2)
+            target1 = round(entry * 1.03, 2)
+            target2 = round(entry * 1.05, 2)
+            risk = round(entry - stop, 2)
+            reward = round(target2 - entry, 2)
+            rr = round(reward / risk, 1) if risk > 0 else 0
+
+            if score >= 8:
+                quality = "A+ 🏆"
+            elif score >= 6:
+                quality = "A ✨"
+            else:
+                quality = "B 👍"
+
+            msg = f"""
+🟢 <b>ALIM SİNYALİ — {ticker}</b>
+
+📊 <b>Analiz:</b>
+{chr(10).join(reasons)}
+
+💰 <b>İşlem Planı:</b>
+• Giriş: <b>${entry:.2f}</b>
+• Stop: <b>${stop:.2f}</b> (%2)
+• Hedef 1: <b>${target1:.2f}</b> (%3)
+• Hedef 2: <b>${target2:.2f}</b> (%5)
+
+⚖️ Risk/Ödül: <b>1:{rr}</b>
+🎯 Setup: <b>{quality}</b> ({score}/9 puan)
+⏰ {datetime.now().strftime('%H:%M')}
+"""
+            return msg
+
+        return None
+
+    except Exception as e:
+        return None
+
+def scan_loop():
+    send_telegram("🦅 <b>Hawk Signal Bot başladı!</b>\n\nNASDAQ taraması başlıyor... Her 5 dakikada sinyal aranacak.")
+    
+    while True:
+        try:
+            signals_found = 0
+            for ticker in WATCHLIST:
+                signal = analyze_stock(ticker)
+                if signal:
+                    send_telegram(signal)
+                    signals_found += 1
+                    time.sleep(2)
+                time.sleep(0.5)
+            
+            if signals_found == 0:
+                # Her 30 dakikada bir "tarama devam ediyor" mesajı
+                pass
+                
+        except Exception as e:
+            pass
+        
+        time.sleep(300)  # 5 dakika bekle
+
+@app.route("/")
+def home():
+    return jsonify({"status": "Hawk Signal Bot çalışıyor 🦅", "watchlist": len(WATCHLIST)})
+
+@app.route("/test")
+def test():
+    send_telegram("🦅 <b>Hawk Signal Bot aktif!</b>\n\nNASDAQ'ta sinyal aranıyor...")
+    return jsonify({"status": "Test mesajı gönderildi!"})
+
+@app.route("/scan")
+def manual_scan():
+    send_telegram("🔍 Manuel tarama başlatıldı...")
+    threading.Thread(target=lambda: [analyze_stock(t) for t in WATCHLIST[:10]]).start()
+    return jsonify({"status": "Tarama başladı"})
+
+if __name__ == "__main__":
+    scanner = threading.Thread(target=scan_loop, daemon=True)
+    scanner.start()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)        if 50 <= rsi <= 65:
             score += 2
             reasons.append(f"✅ RSI: {rsi:.1f} (ideal alım bölgesi)")
         elif 65 < rsi <= 75:
