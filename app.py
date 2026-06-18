@@ -2,7 +2,7 @@ import os
 import time
 import requests
 import threading
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from datetime import datetime, timedelta
 import yfinance as yf
 import pandas as pd
@@ -879,8 +879,41 @@ def test():
     send_telegram("🦅 <b>Hawk Signal Bot v2.0 Aktif!</b>\n\n✅ NASDAQ, BIST, Alman Borsası\n✅ 3 Seans Sistemi\n✅ Manuel Komutlar\n✅ Portföy ve Alarm Takibi")
     return jsonify({"status": "Test mesajı gönderildi!"})
 
-if __name__ == "__main__":
-    threading.Thread(target=telegram_polling, daemon=True).start()
+# =====================
+# WEBHOOK ROUTE
+# =====================
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    try:
+        update = request.get_json(force=True)
+        message = update.get("message", {})
+        text = message.get("text", "")
+        chat_id = str(message.get("chat", {}).get("id", ""))
+        if text and chat_id:
+            threading.Thread(target=handle_command, args=(text, chat_id)).start()
+    except:
+        pass
+    return jsonify({"ok": True})
+
+@app.route("/set_webhook")
+def set_webhook():
+    url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    if not url:
+        return jsonify({"error": "RAILWAY_PUBLIC_DOMAIN not set"})
+    webhook_url = f"https://{url}/webhook"
+    r = requests.get(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
+        params={"url": webhook_url}
+    )
+    return jsonify(r.json())
+
+def start_background():
     threading.Thread(target=auto_scan_loop, daemon=True).start()
+
+# Başlat
+start_background()
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
