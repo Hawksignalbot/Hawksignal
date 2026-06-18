@@ -2,46 +2,49 @@ import os
 import time
 import requests
 import threading
+import random
 from flask import Flask, jsonify, request
-from datetime import datetime, timedelta
+from datetime import datetime
 import pandas as pd
 import numpy as np
 import re
-
-import yfinance as yf
-yf.set_tz_cache_location("/tmp")
 
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+TD_API_KEY = os.environ.get("TD_API_KEY")
 
 # =====================
-# BORSA LİSTELERİ
+# YEDEK HAVUZLAR
 # =====================
 
-NASDAQ_LIST = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AMD",
-    "AVGO", "QCOM", "INTC", "MU", "AMAT", "KLAC", "MRVL", "ORCL",
-    "CRM", "NOW", "SNOW", "PLTR", "DDOG", "NET", "CRWD", "ZS",
-    "PANW", "SHOP", "NFLX", "UBER", "PYPL", "COIN", "MRNA", "BNTX",
-    "ENPH", "FSLR", "RIVN", "RBLX", "U", "IONQ", "QUBT", "TTD"
+NASDAQ_BACKUP = [
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","AMD","AVGO","QCOM",
+    "INTC","MU","AMAT","KLAC","MRVL","ORCL","CRM","NOW","SNOW","PLTR",
+    "DDOG","NET","CRWD","ZS","PANW","SHOP","NFLX","UBER","PYPL","COIN",
+    "MRNA","BNTX","ENPH","FSLR","RIVN","RBLX","U","IONQ","TTD","SOFI",
+    "AFRM","UPST","HOOD","SQ","MSTR","RIOT","MARA","ADBE","CSCO","PEP",
+    "COST","SBUX","GILD","REGN","VRTX","BIIB","ISRG","IDXX","ALGN","DXCM",
+    "ATVI","EA","TTWO","MTTR","QUBT","RGTI","ARQQ","SOUN","CLOV","WKHS",
+    "LCID","NIO","LI","XPEV","RIVN","FSR","GOEV","BLNK","CHPT","PLUG"
 ]
 
-BIST_LIST = [
-    "THYAO.IS", "GARAN.IS", "ASELS.IS", "KCHOL.IS", "EREGL.IS",
-    "BIMAS.IS", "AKBNK.IS", "YKBNK.IS", "TUPRS.IS", "SISE.IS",
-    "PGSUS.IS", "TAVHL.IS", "TOASO.IS", "FROTO.IS", "SAHOL.IS",
-    "HALKB.IS", "VAKBN.IS", "TCELL.IS", "TTKOM.IS", "EKGYO.IS"
+BIST_BACKUP = [
+    "THYAO","GARAN","ASELS","KCHOL","EREGL","BIMAS","AKBNK","YKBNK",
+    "TUPRS","SISE","PGSUS","TAVHL","TOASO","FROTO","SAHOL","HALKB",
+    "VAKBN","TCELL","TTKOM","EKGYO","PETKM","ARCLK","VESTL","LOGO",
+    "NETAS","DOAS","OTKAR","ULKER","CCOLA","AEFES","BRISA","GUBRF",
+    "KOZAL","KRDMD","ISCTR","ALBRK","TSKB","KLNMA","MPARK","MGROS"
 ]
 
-ALMAN_LIST = [
-    "SAP.DE", "SIE.DE", "ALV.DE", "MRK.DE", "BAYN.DE",
-    "BASF.DE", "BMW.DE", "MBG.DE", "VOW3.DE", "DTE.DE",
-    "DBK.DE", "CBK.DE", "BAS.DE", "EOAN.DE", "RWE.DE"
+ALMAN_BACKUP = [
+    "SAP","SIE","ALV","MRK","BAYN","BASF","BMW","MBG","VOW3","DTE",
+    "DBK","CBK","BAS","EOAN","RWE","ADS","LIN","MUV2","HEI","FRE",
+    "HEN3","SHL","ZAL","DHER","QIA","MTX","HFG","NDX1","TUI1","LEG"
 ]
 
-# Portföy ve alarm hafızası
+# Bellek
 portfolio = {}
 alerts = {}
 tracked = {}
@@ -49,51 +52,28 @@ news_archive = {}
 news_counter = {}
 
 # =====================
-# YARDIMCI FONKSİYONLAR
+# YARDIMCI
 # =====================
 
 def normalize_text(text):
-    """Türkçe karakter normalizasyonu ve küçük harf"""
-    replacements = {
-        'İ': 'i', 'I': 'i', 'ı': 'i',
-        'Ü': 'u', 'ü': 'u',
-        'Ö': 'o', 'ö': 'o',
-        'Ş': 's', 'ş': 's',
-        'Ğ': 'g', 'ğ': 'g',
-        'Ç': 'c', 'ç': 'c',
-        'Â': 'a', 'â': 'a'
+    rep = {
+        'İ':'i','I':'i','ı':'i','Ü':'u','ü':'u','Ö':'o','ö':'o',
+        'Ş':'s','ş':'s','Ğ':'g','ğ':'g','Ç':'c','ç':'c','Â':'a','â':'a'
     }
     text = text.lower()
-    for k, v in replacements.items():
-        text = text.replace(k.lower(), v).replace(k, v)
+    for k,v in rep.items():
+        text = text.replace(k.lower(),v).replace(k,v)
     return text
 
 def detect_market(text):
-    """Hangi borsa olduğunu tespit et"""
     t = normalize_text(text)
-    if any(w in t for w in ['nasdaq', 'amerika', 'abd', 'us', 'usa', 'america']):
+    if any(w in t for w in ['nasdaq','amerika','abd','us','usa','america']):
         return 'nasdaq'
-    if any(w in t for w in ['bist', 'turkiye', 'turkey', 'istanbul', 'ist', 'borsa istanbul']):
+    if any(w in t for w in ['bist','turkiye','turkey','istanbul','ist']):
         return 'bist'
-    if any(w in t for w in ['alman', 'almanya', 'dax', 'german', 'germany', 'de', 'xetra']):
+    if any(w in t for w in ['alman','almanya','dax','german','germany']):
         return 'alman'
     return None
-
-def get_market_list(market):
-    if market == 'nasdaq':
-        return NASDAQ_LIST
-    elif market == 'bist':
-        return BIST_LIST
-    elif market == 'alman':
-        return ALMAN_LIST
-    return []
-
-def format_ticker(ticker, market):
-    if market == 'bist' and not ticker.endswith('.IS'):
-        return ticker + '.IS'
-    if market == 'alman' and not ticker.endswith('.DE'):
-        return ticker + '.DE'
-    return ticker
 
 def send_telegram(message, chat_id=None):
     cid = chat_id or CHAT_ID
@@ -104,24 +84,100 @@ def send_telegram(message, chat_id=None):
     except:
         pass
 
-def get_news_id(date_str=None):
-    """Haber numarası üret: DDMMYY/N"""
-    if not date_str:
-        date_str = datetime.now().strftime('%d%m%y')
-    if date_str not in news_counter:
-        news_counter[date_str] = 0
-    news_counter[date_str] += 1
-    return f"{date_str}/{news_counter[date_str]}"
+# =====================
+# 5. KADEME: DİNAMİK HACİM FİLTRESİ
+# =====================
 
-def save_news(news_id, market, title, sentiment, hours_ago, content):
-    news_archive[news_id] = {
-        'market': market,
-        'title': title,
-        'sentiment': sentiment,
-        'hours_ago': hours_ago,
-        'content': content,
-        'date': datetime.now().strftime('%d.%m.%Y %H:%M')
-    }
+def get_top_volume_stocks(market, top_n=100, select_n=30):
+    """
+    Twelve Data'dan o günün en hacimli hisselerini çek,
+    bunlardan rastgele select_n tane seç.
+    Başarısız olursa yedek havuzdan rastgele seç.
+    """
+    try:
+        if market == 'nasdaq':
+            exchange = 'NASDAQ'
+        elif market == 'bist':
+            exchange = 'BIST'
+        elif market == 'alman':
+            exchange = 'XETRA'
+        else:
+            exchange = 'NASDAQ'
+
+        url = "https://api.twelvedata.com/stocks"
+        params = {
+            "exchange": exchange,
+            "apikey": TD_API_KEY,
+            "format": "JSON"
+        }
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+
+        if "data" not in data or not data["data"]:
+            raise Exception("No data")
+
+        symbols = [item["symbol"] for item in data["data"] if item.get("symbol")]
+
+        if len(symbols) > top_n:
+            symbols = symbols[:top_n]
+
+        if len(symbols) < select_n:
+            select_n = len(symbols)
+
+        selected = random.sample(symbols, select_n)
+        return selected
+
+    except:
+        # Yedek havuzdan rastgele seç
+        backup = {
+            'nasdaq': NASDAQ_BACKUP,
+            'bist': BIST_BACKUP,
+            'alman': ALMAN_BACKUP
+        }.get(market, NASDAQ_BACKUP)
+        return random.sample(backup, min(select_n, len(backup)))
+
+# =====================
+# TWELVE DATA VERİ
+# =====================
+
+def td_get_ohlcv(symbol, market, outputsize=100):
+    try:
+        clean_symbol = symbol.replace('.IS','').replace('.XETRA','').replace('.DE','')
+
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": clean_symbol,
+            "interval": "1day",
+            "outputsize": outputsize,
+            "apikey": TD_API_KEY,
+            "format": "JSON"
+        }
+        if market == 'bist':
+            params["exchange"] = "BIST"
+        elif market == 'alman':
+            params["exchange"] = "XETRA"
+
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+
+        if data.get("status") == "error" or "values" not in data:
+            return None
+
+        values = data["values"]
+        df = pd.DataFrame(values)
+        df = df.rename(columns={
+            "datetime":"Date","open":"Open","high":"High",
+            "low":"Low","close":"Close","volume":"Volume"
+        })
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.sort_values("Date").reset_index(drop=True)
+        for col in ["Open","High","Low","Close","Volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        return df, clean_symbol
+
+    except:
+        return None
 
 # =====================
 # GÖSTERGELERİ HESAPLA
@@ -147,44 +203,22 @@ def calc_sma(series, period):
 def calc_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
-def get_earnings_days(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        cal = stock.calendar
-        if cal is not None and not cal.empty:
-            earnings_date = cal.iloc[0, 0]
-            if hasattr(earnings_date, 'date'):
-                days_left = (earnings_date.date() - datetime.now().date()).days
-                return max(0, days_left)
-    except:
-        pass
-    return 999
-
-def get_revenue_growth(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        financials = stock.quarterly_financials
-        if financials is not None and 'Total Revenue' in financials.index:
-            revenues = financials.loc['Total Revenue'].dropna()
-            if len(revenues) >= 2:
-                growth = (revenues.iloc[0] - revenues.iloc[1]) / abs(revenues.iloc[1])
-                return float(growth)
-    except:
-        pass
-    return None
-
 # =====================
-# ANA ANALİZ FONKSİYONU
+# ANA ANALİZ (4 KADEME)
 # =====================
 
-def analyze_stock(ticker, market='nasdaq'):
+def analyze_stock(symbol, market):
     try:
-        df = yf.download(ticker, period="200d", interval="1d", progress=False)
-        if df is None or len(df) < 60:
+        result = td_get_ohlcv(symbol, market, outputsize=210)
+        if result is None:
+            return None
+        df, clean_symbol = result
+
+        if len(df) < 60:
             return None
 
-        close = df['Close'].squeeze()
-        volume = df['Volume'].squeeze()
+        close = df['Close']
+        volume = df['Volume']
 
         rsi = calc_rsi(close)
         macd, macd_signal = calc_macd(close)
@@ -206,29 +240,25 @@ def analyze_stock(ticker, market='nasdaq'):
         vol_now = float(volume.iloc[-1])
         vol_avg = float(vol_ma20.iloc[-1])
 
-        # Filtre 1: Trend
+        # KADEME 1: TREND
         trend_sma200 = "✅ Yukarıda" if price > sma200_now else "⚠️ Aşağıda"
         trend_ema20 = "✅ Yukarıda" if price > ema20_now else "⚠️ Aşağıda"
         trend_sma50 = "✅ Yukarıda" if price > sma50_now else "⚠️ Aşağıda"
-
         resistance_risk = (
             (abs(price - sma50_now) / price < 0.02 and price < sma50_now) or
             (abs(price - sma200_now) / price < 0.02 and price < sma200_now)
         )
 
-        # Filtre 2: Teknik
+        # KADEME 2: TEKNİK
         rsi_signal = rsi_now > rsi_prev and 40 < rsi_now < 65
         macd_crossover = macd_prev_val < macd_sig_prev and macd_now > macd_sig_now
         macd_positive = macd_now > macd_sig_now
         vol_ratio = vol_now / vol_avg if vol_avg > 0 else 0
 
-        # Filtre 3: Bilanço
-        earnings_days = get_earnings_days(ticker)
-        if earnings_days <= 7:
-            return None
-        revenue_growth = get_revenue_growth(ticker)
+        # KADEME 3: HACİM (5. kademe zaten hisse seçiminde uygulandı)
+        vol_ok = vol_ratio >= 1.2
 
-        # Skor
+        # KADEME 4: SKOR
         score = 0
         if price > sma200_now: score += 2
         if price > sma50_now: score += 1
@@ -236,19 +266,18 @@ def analyze_stock(ticker, market='nasdaq'):
         if macd_crossover: score += 3
         elif macd_positive: score += 1
         if rsi_signal: score += 2
-        if vol_ratio >= 1.2: score += 2
+        if vol_ok: score += 2
         if price < sma200_now: score -= 2
         if resistance_risk: score -= 2
-        if revenue_growth is not None and revenue_growth < 0: score -= 1
 
         if score < 6:
             return None
 
-        # Risk
+        # RİSK
         risk_score = max(10, min(90, 100 - (score * 10)))
         risk_label = "Düşük 🟢" if risk_score < 30 else "Orta 🟡" if risk_score < 60 else "Yüksek 🔴"
 
-        # Filtre 4: Çıkış
+        # ÇIKIŞ STRATEJİSİ
         entry = price
         take_profit = round(entry * 1.05, 2)
         support = max(ema20_now, sma50_now * 0.99)
@@ -260,24 +289,22 @@ def analyze_stock(ticker, market='nasdaq'):
         vol_text = f"✅ {vol_ratio:.1f}x 🔥" if vol_ratio >= 2 else f"✅ {vol_ratio:.1f}x" if vol_ratio >= 1.2 else f"⚠️ {vol_ratio:.1f}x"
         macd_text = "✅ Taze Crossover 🔥" if macd_crossover else "✅ Pozitif" if macd_positive else "⚠️ Negatif"
         rsi_text = f"✅ {rsi_now:.1f}" if rsi_signal else f"⚠️ {rsi_now:.1f}"
-        earnings_text = f"⚠️ {earnings_days} gün kaldı" if earnings_days < 30 else f"✅ Güvenli"
-        rev_text = f"{'✅' if revenue_growth and revenue_growth > 0 else '⚠️'} {revenue_growth*100:.1f}%" if revenue_growth is not None else "— Veri yok"
 
         if score >= 8 and rr >= 2:
-            karar = "💚 İŞLEME GİRİLEBİLİR. Güçlü setup."
+            karar = "💚 İŞLEME GİRİLEBİLİR"
         elif score >= 6:
-            karar = "🟡 İZLEMEDE KALSIN. Onay bekleniyor."
+            karar = "🟡 İZLEMEDE KALSIN"
         else:
-            karar = "🔴 GEÇ. Kriterler yetersiz."
+            karar = "🔴 GEÇ"
 
-        clean_ticker = ticker.replace('.IS', '').replace('.DE', '')
+        currency = "₺" if market == 'bist' else "€" if market == 'alman' else "$"
 
         msg = f"""
-🚨 <b>{clean_ticker} - POTANSİYEL SİNYAL</b>
+🚨 <b>{clean_symbol} - POTANSİYEL SİNYAL</b>
 ──────────────────────────
-📈 Giriş: <b>${entry:.2f}</b>
-🎯 Kar Al (%5): <b>${take_profit:.2f}</b>
-🛑 Zarar Kes: <b>${stop_loss:.2f}</b>
+📈 Giriş: <b>{currency}{entry:.2f}</b>
+🎯 Kar Al (%5): <b>{currency}{take_profit:.2f}</b>
+🛑 Zarar Kes: <b>{currency}{stop_loss:.2f}</b>
 ⚖️ Risk/Ödül: <b>1:{rr}</b>
 
 📊 <b>Teknik Durum:</b>
@@ -288,8 +315,6 @@ def analyze_stock(ticker, market='nasdaq'):
 • Hacim: {vol_text}
 
 ⚠️ <b>Risk:</b>
-• Bilanço: {earnings_text}
-• Gelir Büyümesi: {rev_text}
 • Direnç: {"⚠️ Kritik seviye yakın" if resistance_risk else "✅ Temiz"}
 • Risk Skoru: %{risk_score} - {risk_label}
 
@@ -302,47 +327,34 @@ def analyze_stock(ticker, market='nasdaq'):
         return None
 
 # =====================
-# UYUMSUZLUK ANALİZİ
+# UYUMSUZLUK
 # =====================
 
-def check_divergence(ticker):
+def check_divergence(symbol, market):
     try:
-        df = yf.download(ticker, period="60d", interval="1d", progress=False)
-        if df is None or len(df) < 30:
+        result = td_get_ohlcv(symbol, market, outputsize=30)
+        if result is None:
+            return None
+        df, clean_symbol = result
+        if len(df) < 15:
             return None
 
-        close = df['Close'].squeeze()
+        close = df['Close']
         rsi = calc_rsi(close)
-        macd, macd_signal = calc_macd(close)
-
         prices = close.values[-10:]
         rsi_vals = rsi.values[-10:]
-        macd_vals = macd.values[-10:]
-
-        price_low_idx = np.argmin(prices)
-        price_high_idx = np.argmax(prices)
-
-        bull_div = False
-        bear_div = False
         div_time = datetime.now().strftime('%H:%M')
 
-        # Boğa uyumsuzluğu
-        if price_low_idx < len(prices) - 1:
-            if prices[-1] < prices[price_low_idx] and rsi_vals[-1] > rsi_vals[price_low_idx]:
-                bull_div = True
+        price_low_idx = int(np.argmin(prices[:-1]))
+        price_high_idx = int(np.argmax(prices[:-1]))
 
-        # Ayı uyumsuzluğu
-        if price_high_idx < len(prices) - 1:
-            if prices[-1] > prices[price_high_idx] and rsi_vals[-1] < rsi_vals[price_high_idx]:
-                bear_div = True
-
-        clean_ticker = ticker.replace('.IS', '').replace('.DE', '')
+        bull_div = prices[-1] < prices[price_low_idx] and rsi_vals[-1] > rsi_vals[price_low_idx]
+        bear_div = prices[-1] > prices[price_high_idx] and rsi_vals[-1] < rsi_vals[price_high_idx]
 
         if bull_div:
-            return f"⚡ <b>BOĞA UYUMSUZLUĞU — {clean_ticker}</b>\nTür: Al Sinyali\nBaşlangıç: {div_time}\nFiyat yeni dip yaparken RSI yükseliyor\nRSI: {rsi_vals[-1]:.1f}"
+            return f"⚡ <b>BOĞA UYUMSUZLUĞU — {clean_symbol}</b>\nTür: Al Sinyali\nBaşlangıç: {div_time}\nFiyat yeni dip yaparken RSI yükseliyor\nRSI: {rsi_vals[-1]:.1f}"
         if bear_div:
-            return f"⚡ <b>AYI UYUMSUZLUĞU — {clean_ticker}</b>\nTür: Sat Sinyali\nBaşlangıç: {div_time}\nFiyat yeni zirve yaparken RSI düşüyor\nRSI: {rsi_vals[-1]:.1f}"
-
+            return f"⚡ <b>AYI UYUMSUZLUĞU — {clean_symbol}</b>\nTür: Sat Sinyali\nBaşlangıç: {div_time}\nFiyat yeni zirve yaparken RSI düşüyor\nRSI: {rsi_vals[-1]:.1f}"
         return None
     except:
         return None
@@ -353,248 +365,206 @@ def check_divergence(ticker):
 
 def handle_command(text, chat_id):
     t = normalize_text(text.strip())
-    original = text.strip()
 
-    # /start veya /durum veya /status
-    if any(t.startswith(x) for x in ['/start', '/durum', '/status']):
-        send_telegram("""🦅 <b>HAWK SIGNAL BOT v2.0</b>
+    if any(t.startswith(x) for x in ['/start','/durum','/status']):
+        send_telegram("""🦅 <b>HAWK SIGNAL BOT v3.0</b>
 ──────────────────────────
 /durum — /status
 /yardim — /help
 /liste — /list
 ──────────────────────────
-📈 TARAMA
-📊 ANALİZ
-⚡ UYUMSUZLUK
-📌 TAKİP
-📰 HABERLER
-🔔 ALARMLAR
-💼 PORTFÖY
+📈 TARAMA | ⚡ UYUMSUZLUK
+📌 TAKİP | 📊 ANALİZ
+📰 HABERLER | 🔔 ALARMLAR | 💼 PORTFÖY
 ──────────────────────────
 Detay için /yardim veya /help""", chat_id)
         return
 
-    # /yardim (Türkçe)
-    if any(t.startswith(x) for x in ['/yardim', '/yardım', '/komutlar', '/komut']):
-        send_telegram("""📋 <b>HAWK SIGNAL BOT — KOMUTLAR</b>
+    if any(t.startswith(x) for x in ['/yardim','/yardım','/komutlar','/komut']):
+        send_telegram("""📋 <b>KOMUTLAR</b>
 
 /durum — Sistem durumu
-/liste — İzleme listesi
-/yardim — Bu menü (Türkçe)
-/help — This menu (English)
+/liste — Hisse havuzu bilgisi
 ──────────────────────────
 📈 <b>TARAMA</b>
-/nasdaq tara — NASDAQ tara
-/nasdaq [HİSSE] — Tek hisse
-/bist tara — BIST tara
-/bist [HİSSE] — Tek hisse
-/alman tara — Alman tara
-/alman [HİSSE] — Tek hisse
+/nasdaq tara | /bist tara | /alman tara
+/abd tara | /turkiye tara | /almanya tara
+/nasdaq [HİSSE] | /bist [HİSSE] | /alman [HİSSE]
 
 ⚡ <b>UYUMSUZLUK</b>
-/uyumsuzluk [borsa]
+/uyumsuzluk nasdaq|bist|alman
 
 📌 <b>TAKİP</b>
-/takip [hisse] giris[f] stop[f] hedef[f]
+/takip [hisse] [giris] [stop] [hedef]
 /takiplerim
 
 📊 <b>ANALİZ</b>
 /analizet [hisse veya haber no]
 /analiz et [hisse veya haber no]
-/ozet [borsa] [tarih]
 
 📰 <b>HABERLER</b>
-/haberler [borsa]
+/haberler nasdaq|bist|alman
 /haberlerhepsi [tarih]
-/habertekrar [tarih]
+/ozet [borsa] [tarih]
 
 🔔 <b>ALARMLAR</b>
 /alarm [hisse] [fiyat]
-/alarmlarim
-/alarm sil [hisse]
+/alarmlarim | /alarm sil [hisse]
 
 💼 <b>PORTFÖY</b>
 /portfoy ekle [hisse] [fiyat] [adet]
-/portfoy
-/portfoy [hisse]""", chat_id)
+/portfoy | /portfoy [hisse]""", chat_id)
         return
 
-    # /help (İngilizce)
     if t.startswith('/help'):
-        send_telegram("""📋 <b>HAWK SIGNAL BOT — COMMANDS</b>
+        send_telegram("""📋 <b>COMMANDS</b>
 
 /status — System status
-/list — Watchlist
-/help — This menu (English)
-/yardim — Bu menü (Türkçe)
+/list — Watchlist info
 ──────────────────────────
 📈 <b>SCAN</b>
-/nasdaq scan — Scan NASDAQ
-/nasdaq [TICKER] — Single stock
-/bist scan — Scan BIST
-/bist [TICKER] — Single stock
-/german scan — Scan German
-/german [TICKER] — Single stock
+/nasdaq scan | /bist scan | /german scan
+/nasdaq [TICKER] | /bist [TICKER] | /german [TICKER]
 
 ⚡ <b>DIVERGENCE</b>
-/divergence [market]
+/divergence nasdaq|bist|german
 
 📌 <b>TRACKING</b>
-/track [ticker] entry[p] stop[p] target[p]
+/track [ticker] [entry] [stop] [target]
 /mytracks
 
 📊 <b>ANALYSIS</b>
 /analyze [ticker or news id]
 /analysis [ticker or news id]
-/summary [market] [date]
 
 📰 <b>NEWS</b>
-/news [market]
-/newsall [date]
-/newsrepeat [date]
+/news nasdaq|bist|german
+/newsall [date] | /summary [market] [date]
 
 🔔 <b>ALERTS</b>
 /alert [ticker] [price]
-/alerts
-/alert delete [ticker]
+/alerts | /alert delete [ticker]
 
 💼 <b>PORTFOLIO</b>
 /portfolio add [ticker] [price] [qty]
-/portfolio
-/portfolio [ticker]""", chat_id)
+/portfolio | /portfolio [ticker]""", chat_id)
         return
 
-    # /liste veya /list
-    if any(t.startswith(x) for x in ['/liste', '/list']):
-        msg = f"""📋 <b>İZLEME LİSTESİ</b>
+    if any(t.startswith(x) for x in ['/liste','/list']):
+        send_telegram("""📋 <b>HİSSE HAVUZU</b>
 
-🇺🇸 <b>NASDAQ</b> ({len(NASDAQ_LIST)} hisse)
-{', '.join(NASDAQ_LIST)}
+🇺🇸 NASDAQ: 70+ hisse havuzu
+🇹🇷 BIST: 40 hisse havuzu
+🇩🇪 Alman: 30 hisse havuzu
 
-🇹🇷 <b>BIST</b> ({len(BIST_LIST)} hisse)
-{', '.join([x.replace('.IS','') for x in BIST_LIST])}
+Her taramada:
+1️⃣ O günün en hacimli hisseleri belirlenir
+2️⃣ Bunlardan rastgele 30 hisse seçilir
+3️⃣ 5 katmanlı analizden geçirilir
 
-🇩🇪 <b>ALMAN</b> ({len(ALMAN_LIST)} hisse)
-{', '.join([x.replace('.DE','') for x in ALMAN_LIST])}"""
-        send_telegram(msg, chat_id)
+Her tarama farklı hisselerle yapılır.""", chat_id)
         return
 
     # TARAMA KOMUTLARI
-    for cmd, market, market_list in [
-        ('/nasdaq', 'nasdaq', NASDAQ_LIST),
-        ('/bist', 'bist', BIST_LIST),
-        ('/alman', 'alman', ALMAN_LIST),
-        ('/german', 'alman', ALMAN_LIST),
-        ('/amerika', 'nasdaq', NASDAQ_LIST),
-        ('/abd', 'nasdaq', NASDAQ_LIST),
-        ('/turkiye', 'bist', BIST_LIST),
-        ('/istanbul', 'bist', BIST_LIST),
-        ('/almanya', 'alman', ALMAN_LIST),
-        ('/dax', 'alman', ALMAN_LIST),
-    ]:
+    market_map = {
+        '/nasdaq':'nasdaq','/abd':'nasdaq','/amerika':'nasdaq','/us':'nasdaq','/america':'nasdaq',
+        '/bist':'bist','/turkiye':'bist','/istanbul':'bist','/turkey':'bist',
+        '/alman':'alman','/almanya':'alman','/dax':'alman','/german':'alman','/germany':'alman'
+    }
+
+    for cmd, market in market_map.items():
         if t.startswith(cmd):
             rest = t[len(cmd):].strip()
-            if any(x in rest for x in ['tara', 'scan', 'tarat']):
-                send_telegram(f"🔍 {market.upper()} taraması başladı...", chat_id)
-                def do_scan(ml=market_list, m=market, cid=chat_id):
+
+            if any(x in rest for x in ['tara','scan','tarat']):
+                send_telegram(f"🔍 {market.upper()} taraması başladı...\n5. kademe: Hacim filtresi uygulanıyor", chat_id)
+                def do_scan(m=market, cid=chat_id):
+                    batch = get_top_volume_stocks(m, top_n=100, select_n=30)
                     found = 0
-                    for ticker in ml:
+                    for ticker in batch:
                         signal = analyze_stock(ticker, m)
                         if signal:
                             send_telegram(signal, cid)
                             found += 1
                             time.sleep(2)
+                        time.sleep(1.2)
                     if found == 0:
-                        send_telegram(f"Şu an {m.upper()} için uygun setup bulunamadı.", cid)
+                        send_telegram(f"{m.upper()} taraması tamamlandı. Şu an uygun setup bulunamadı.", cid)
                 threading.Thread(target=do_scan).start()
+
             elif rest:
-                ticker_raw = rest.upper().split()[0]
-                ticker = format_ticker(ticker_raw, market)
-                send_telegram(f"🔍 {ticker_raw} analiz ediliyor...", chat_id)
-                def do_single(t=ticker, m=market, cid=chat_id, tr=ticker_raw):
-                    signal = analyze_stock(t, m)
+                ticker = rest.upper().split()[0]
+                send_telegram(f"🔍 {ticker} analiz ediliyor...", chat_id)
+                def do_single(tk=ticker, m=market, cid=chat_id):
+                    signal = analyze_stock(tk, m)
                     if signal:
                         send_telegram(signal, cid)
                     else:
-                        send_telegram(f"{tr} için şu an uygun setup yok veya veri alınamadı.", cid)
+                        send_telegram(f"{tk} için şu an uygun setup yok.", cid)
                 threading.Thread(target=do_single).start()
             return
 
     # UYUMSUZLUK
-    if any(t.startswith(x) for x in ['/uyumsuzluk', '/divergence']):
-        rest = t.split(None, 1)[1] if len(t.split()) > 1 else ''
-        market = detect_market(rest) or 'nasdaq'
-        market_list = get_market_list(market)
+    if any(t.startswith(x) for x in ['/uyumsuzluk','/divergence']):
+        parts = t.split(None,1)
+        query = parts[1] if len(parts) > 1 else ''
+        market = detect_market(query) or 'nasdaq'
         send_telegram(f"⚡ {market.upper()} uyumsuzluk taraması başladı...", chat_id)
-        def do_div(ml=market_list, cid=chat_id, m=market):
+        def do_div(m=market, cid=chat_id):
+            batch = get_top_volume_stocks(m, top_n=50, select_n=20)
             found = 0
-            for ticker in ml:
-                result = check_divergence(ticker)
+            for ticker in batch:
+                result = check_divergence(ticker, m)
                 if result:
                     send_telegram(result, cid)
                     found += 1
                     time.sleep(1)
+                time.sleep(1)
             if found == 0:
                 send_telegram(f"{m.upper()} için uyumsuzluk tespit edilemedi.", cid)
         threading.Thread(target=do_div).start()
         return
 
-    # ANALİZ ET
-    if any(t.startswith(x) for x in ['/analizet', '/analiz et', '/analyze', '/analysis']):
-        parts = original.split(None, 1)
+    # ANALİZ
+    if any(t.startswith(x) for x in ['/analizet','/analiz','/analyze','/analysis']):
+        parts = text.split(None,1)
         if len(parts) < 2:
-            send_telegram("Kullanım: /analizet [HİSSE veya HABER_NO]", chat_id)
+            send_telegram("Kullanım: /analizet [HİSSE]", chat_id)
             return
         query = parts[1].strip()
 
-        # Haber no mu?
-        if '/' in query and re.match(r'\d{6}/\d+', query):
+        if re.match(r'\d{6}/\d+', query):
             if query in news_archive:
                 n = news_archive[query]
-                send_telegram(f"""📊 <b>HABER ANALİZİ — {query}</b>
-Tarih: {n['date']}
-Borsa: {n['market'].upper()}
-Başlık: {n['title']}
-Duygu: {n['sentiment']}
-
-{n['content']}""", chat_id)
+                send_telegram(f"📊 <b>{query}</b>\n{n['title']}\n{n['content']}", chat_id)
             else:
                 send_telegram(f"{query} numaralı haber bulunamadı.", chat_id)
             return
 
-        # Hisse analizi
-        ticker_raw = query.upper().split()[0]
+        ticker = query.upper().split()[0]
         market = detect_market(query) or 'nasdaq'
-        ticker = format_ticker(ticker_raw, market)
-        send_telegram(f"🔍 {ticker_raw} analiz ediliyor...", chat_id)
-        def do_analyze(t=ticker, m=market, cid=chat_id, tr=ticker_raw):
-            signal = analyze_stock(t, m)
+        send_telegram(f"🔍 {ticker} analiz ediliyor...", chat_id)
+        def do_analyze(tk=ticker, m=market, cid=chat_id):
+            signal = analyze_stock(tk, m)
             if signal:
                 send_telegram(signal, cid)
             else:
-                send_telegram(f"{tr} için şu an uygun setup yok.", cid)
+                send_telegram(f"{tk} için şu an uygun setup yok.", cid)
         threading.Thread(target=do_analyze).start()
         return
 
-    # ÖZET / SUMMARY
-    if any(t.startswith(x) for x in ['/ozet', '/özet', '/summary']):
-        parts = original.split(None, 1)
-        query = parts[1].strip() if len(parts) > 1 else ''
-        market = detect_market(query) or 'tum'
-        send_telegram(f"📊 {market.upper()} özet hazırlanıyor... (yakında)", chat_id)
-        return
-
     # HABERLER
-    if any(t.startswith(x) for x in ['/haberler', '/haber', '/news']):
-        rest = t.split(None, 1)[1] if len(t.split()) > 1 else ''
+    if any(t.startswith(x) for x in ['/haberler','/haber','/news']):
+        parts = t.split(None,1)
+        query = parts[1] if len(parts) > 1 else ''
+        market = detect_market(query) or 'nasdaq'
 
-        # Tüm haberler (haberlerhepsi / newsall)
-        if any(x in t for x in ['hepsi', 'all', 'tekrar', 'repeat']):
-            date_match = re.search(r'\d{6}', rest)
+        if any(x in t for x in ['hepsi','all','tekrar','repeat']):
+            date_match = re.search(r'\d{6}', query)
             date_str = date_match.group() if date_match else datetime.now().strftime('%d%m%y')
-            matching = {k: v for k, v in news_archive.items() if k.startswith(date_str)}
+            matching = {k:v for k,v in news_archive.items() if k.startswith(date_str)}
             if matching:
-                msg = f"📰 <b>{date_str} TÜM HABERLERİ</b>\n──────────────────────────\n"
+                msg = f"📰 <b>{date_str} TÜM HABERLERİ</b>\n"
                 for nid, n in matching.items():
                     msg += f"\n{nid} — {n['title']}\n{n['sentiment']} — {n['hours_ago']} saat önce\n"
                 send_telegram(msg, chat_id)
@@ -602,16 +572,29 @@ Duygu: {n['sentiment']}
                 send_telegram(f"{date_str} tarihine ait haber bulunamadı.", chat_id)
             return
 
-        market = detect_market(rest) or 'nasdaq'
-        send_telegram(f"📰 {market.upper()} haberleri aranıyor... (gerçek zamanlı haber entegrasyonu yakında eklenecek)", chat_id)
+        send_telegram(f"📰 {market.upper()} haber entegrasyonu yakında aktif olacak.", chat_id)
+        return
+
+    # ÖZET / SUMMARY
+    if any(t.startswith(x) for x in ['/ozet','/özet','/summary']):
+        send_telegram("📊 Özet özelliği yakında aktif olacak.", chat_id)
         return
 
     # ALARMLAR
-    if t.startswith('/alarm') or t.startswith('/alert'):
-        parts = original.split()
+    if any(t.startswith(x) for x in ['/alarm','/alert']):
+        parts = text.split()
 
-        # Alarm sil
-        if any(x in t for x in ['sil', 'delete', 'kaldir', 'remove']):
+        if any(t.startswith(x) for x in ['/alarmlarim','/alerts']):
+            if alerts:
+                msg = "🔔 <b>ALARMLARIM</b>\n"
+                for ticker, data in alerts.items():
+                    msg += f"{ticker} → {data['price']}\n"
+                send_telegram(msg, chat_id)
+            else:
+                send_telegram("Aktif alarm yok.", chat_id)
+            return
+
+        if any(x in t for x in ['sil','delete']):
             if len(parts) >= 3:
                 ticker = parts[-1].upper()
                 if ticker in alerts:
@@ -621,92 +604,59 @@ Duygu: {n['sentiment']}
                     send_telegram(f"{ticker} için alarm bulunamadı.", chat_id)
             return
 
-        # Alarmlarım
-        if any(t.startswith(x) for x in ['/alarmlarim', '/alerts']):
-            if alerts:
-                msg = "🔔 <b>ALARMLARIM</b>\n──────────────────────────\n"
-                for ticker, data in alerts.items():
-                    msg += f"{ticker} → ${data['price']}\n"
-                send_telegram(msg, chat_id)
-            else:
-                send_telegram("Aktif alarm yok.", chat_id)
-            return
-
-        # Alarm ekle
         if len(parts) >= 3:
-            ticker = parts[1].upper()
             try:
+                ticker = parts[1].upper()
                 price = float(parts[2])
                 alerts[ticker] = {'price': price, 'chat_id': chat_id}
-                send_telegram(f"🔔 Alarm kuruldu: {ticker} → ${price}", chat_id)
+                send_telegram(f"🔔 Alarm kuruldu: {ticker} → {price}", chat_id)
             except:
                 send_telegram("Kullanım: /alarm [HİSSE] [FİYAT]", chat_id)
         return
 
     # PORTFÖY
-    if any(t.startswith(x) for x in ['/portfoy', '/portföy', '/portfolio']):
-        parts = original.split()
+    if any(t.startswith(x) for x in ['/portfoy','/portföy','/portfolio']):
+        parts = text.split()
 
-        # Ekle
-        if any(x in t for x in ['ekle', 'add']):
+        if any(x in t for x in ['ekle','add']):
             if len(parts) >= 5:
                 try:
                     ticker = parts[2].upper()
                     price = float(parts[3])
                     qty = float(parts[4])
                     portfolio[ticker] = {'price': price, 'qty': qty, 'chat_id': chat_id}
-                    total = price * qty
-                    send_telegram(f"✅ Portföye eklendi:\n{ticker} — {qty} adet @ ${price}\nToplam: ${total:.2f}", chat_id)
+                    send_telegram(f"✅ {ticker} — {qty} adet @ {price} portföye eklendi.", chat_id)
                 except:
                     send_telegram("Kullanım: /portfoy ekle [HİSSE] [FİYAT] [ADET]", chat_id)
             return
 
-        # Tek hisse
-        if len(parts) >= 2 and not any(x in t for x in ['ekle', 'add']):
+        if len(parts) >= 2 and not any(x in t for x in ['ekle','add']):
             ticker = parts[1].upper()
             if ticker in portfolio:
                 p = portfolio[ticker]
-                try:
-                    current = yf.Ticker(ticker).fast_info['last_price']
-                    pnl = (current - p['price']) * p['qty']
-                    pnl_pct = ((current - p['price']) / p['price']) * 100
-                    send_telegram(f"""💼 <b>PORTFÖY — {ticker}</b>
-Alış: ${p['price']} x {p['qty']} adet
-Güncel: ${current:.2f}
-Kar/Zarar: ${pnl:.2f} (%{pnl_pct:.2f})""", chat_id)
-                except:
-                    send_telegram(f"{ticker} için güncel fiyat alınamadı.", chat_id)
+                send_telegram(f"💼 {ticker}\nAlış: {p['price']} x {p['qty']} adet", chat_id)
             else:
-                send_telegram(f"{ticker} portföyde bulunamadı.", chat_id)
+                send_telegram(f"{ticker} portföyde yok.", chat_id)
             return
 
-        # Tüm portföy
         if portfolio:
-            msg = "💼 <b>PORTFÖYÜM</b>\n──────────────────────────\n"
-            total_pnl = 0
+            msg = "💼 <b>PORTFÖYÜM</b>\n"
             for ticker, p in portfolio.items():
-                try:
-                    current = yf.Ticker(ticker).fast_info['last_price']
-                    pnl = (current - p['price']) * p['qty']
-                    total_pnl += pnl
-                    msg += f"{ticker}: ${current:.2f} | K/Z: ${pnl:.2f}\n"
-                except:
-                    msg += f"{ticker}: Fiyat alınamadı\n"
-            msg += f"\nToplam K/Z: ${total_pnl:.2f}"
+                msg += f"{ticker}: {p['price']} x {p['qty']}\n"
             send_telegram(msg, chat_id)
         else:
             send_telegram("Portföy boş.", chat_id)
         return
 
     # TAKİP
-    if any(t.startswith(x) for x in ['/takip', '/track']):
-        parts = original.split()
+    if any(t.startswith(x) for x in ['/takip','/track']):
+        parts = text.split()
 
-        if any(x in t for x in ['takiplerim', 'mytracks']):
+        if any(x in t for x in ['takiplerim','mytracks']):
             if tracked:
-                msg = "📌 <b>TAKİP LİSTEM</b>\n──────────────────────────\n"
+                msg = "📌 <b>TAKİP LİSTEM</b>\n"
                 for ticker, data in tracked.items():
-                    msg += f"{ticker} — Giriş: ${data['entry']} Stop: ${data['stop']} Hedef: ${data['target']}\n"
+                    msg += f"{ticker} — Giriş:{data['entry']} Stop:{data['stop']} Hedef:{data['target']}\n"
                 send_telegram(msg, chat_id)
             else:
                 send_telegram("Takip listesi boş.", chat_id)
@@ -715,174 +665,19 @@ Kar/Zarar: ${pnl:.2f} (%{pnl_pct:.2f})""", chat_id)
         if len(parts) >= 5:
             try:
                 ticker = parts[1].upper()
-                entry = float(parts[2].replace('giris', '').replace('entry', ''))
-                stop = float(parts[3].replace('stop', ''))
-                target = float(parts[4].replace('hedef', '').replace('target', ''))
+                entry = float(parts[2])
+                stop = float(parts[3])
+                target = float(parts[4])
                 tracked[ticker] = {'entry': entry, 'stop': stop, 'target': target, 'chat_id': chat_id}
-                send_telegram(f"📌 Takibe alındı: {ticker}\nGiriş: ${entry} | Stop: ${stop} | Hedef: ${target}", chat_id)
+                send_telegram(f"📌 {ticker} takibe alındı.\nGiriş:{entry} Stop:{stop} Hedef:{target}", chat_id)
             except:
                 send_telegram("Kullanım: /takip [HİSSE] [GİRİŞ] [STOP] [HEDEF]", chat_id)
         return
 
-    # Tanınmayan komut
     send_telegram("Komut tanınamadı. /yardim veya /help yazabilirsin.", chat_id)
 
 # =====================
-# TELEGRAM POLLING
-# =====================
-
-def telegram_polling():
-    offset = None
-    while True:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-            params = {"timeout": 30, "offset": offset}
-            response = requests.get(url, params=params, timeout=35)
-            data = response.json()
-
-            if data.get("ok"):
-                for update in data.get("result", []):
-                    offset = update["update_id"] + 1
-                    message = update.get("message", {})
-                    text = message.get("text", "")
-                    chat_id = message.get("chat", {}).get("id")
-
-                    if text and chat_id and text.startswith("/"):
-                        threading.Thread(
-                            target=handle_command,
-                            args=(text, str(chat_id))
-                        ).start()
-        except:
-            pass
-        time.sleep(1)
-
-# =====================
-# SEANS SİSTEMİ
-# =====================
-
-def is_nasdaq_session():
-    now = datetime.utcnow()
-    hour = now.hour
-    # Pre-market: 12:00-13:30 UTC (15:00-16:30 TR)
-    # Regular: 13:30-20:00 UTC (16:30-23:00 TR)
-    # After-hours: 20:00-23:00 UTC (23:00-02:00 TR)
-    return 12 <= hour <= 23
-
-def is_bist_session():
-    now = datetime.utcnow()
-    hour = now.hour
-    minute = now.minute
-    # BIST: 07:00-15:00 UTC (10:00-18:00 TR)
-    # Öğle arası: 09:30-11:00 UTC (12:30-14:00 TR)
-    if 7 <= hour < 15:
-        if hour == 9 and minute >= 30:
-            return False
-        if hour == 10:
-            return False
-        if hour == 11 and minute == 0:
-            return False
-        return True
-    return False
-
-def get_session_type():
-    now = datetime.utcnow()
-    hour = now.hour
-    if 12 <= hour < 13:
-        return 'nasdaq_premarket'
-    elif 13 <= hour < 20:
-        return 'nasdaq_regular'
-    elif 20 <= hour <= 23:
-        return 'nasdaq_afterhours'
-    return None
-
-def auto_scan_loop():
-    send_telegram("🦅 <b>Hawk Signal Bot v2.0 Başladı!</b>\n\n✅ 4 Katmanlı Filtre\n✅ 3 Borsa\n✅ Seans Sistemi\n✅ Manuel Komutlar Aktif")
-
-    last_bist_premarket = None
-    last_bist_lunch = None
-
-    while True:
-        try:
-            now = datetime.utcnow()
-            hour = now.hour
-
-            # BIST açılış öncesi (09:00 TR = 06:00 UTC)
-            if hour == 6 and last_bist_premarket != now.date():
-                last_bist_premarket = now.date()
-                send_telegram("🇹🇷 <b>BIST Açılış Öncesi Tarama</b>\nPiyasa 1 saat sonra açılıyor...")
-                for ticker in BIST_LIST[:10]:
-                    signal = analyze_stock(ticker, 'bist')
-                    if signal:
-                        send_telegram(signal)
-                        time.sleep(2)
-
-            # BIST öğle arası (12:30 TR = 09:30 UTC)
-            if hour == 9 and now.minute == 30 and last_bist_lunch != now.date():
-                last_bist_lunch = now.date()
-                send_telegram("🇹🇷 <b>BIST Öğle Arası Özeti</b>\nSabah seansı tamamlandı. Öğleden sonra için izleme listesi hazırlanıyor...")
-
-            # NASDAQ regular session taraması (her 5 dakika)
-            if is_nasdaq_session():
-                session = get_session_type()
-                for ticker in NASDAQ_LIST:
-                    signal = analyze_stock(ticker, 'nasdaq')
-                    if signal:
-                        if session == 'nasdaq_afterhours':
-                            signal = "⚠️ <b>AFTER-HOURS SİNYALİ</b> (Ertesi gün için)\n" + signal
-                        send_telegram(signal)
-                        time.sleep(2)
-                    time.sleep(0.5)
-
-            # BIST regular session taraması
-            if is_bist_session():
-                for ticker in BIST_LIST:
-                    signal = analyze_stock(ticker, 'bist')
-                    if signal:
-                        send_telegram(signal)
-                        time.sleep(2)
-                    time.sleep(0.5)
-
-            # Takip edilen hisseleri kontrol et
-            for ticker, data in tracked.items():
-                try:
-                    current = yf.Ticker(ticker).fast_info['last_price']
-                    if current <= data['stop']:
-                        send_telegram(f"🛑 <b>STOP UYARISI — {ticker}</b>\nFiyat ${current:.2f} — Stop seviyesi ${data['stop']} kırıldı!", data['chat_id'])
-                    elif current >= data['target']:
-                        send_telegram(f"🎯 <b>HEDEF UYARISI — {ticker}</b>\nFiyat ${current:.2f} — Hedef ${data['target']} seviyesine ulaştı!", data['chat_id'])
-                except:
-                    pass
-
-            # Alarm kontrolü
-            for ticker, data in list(alerts.items()):
-                try:
-                    current = yf.Ticker(ticker).fast_info['last_price']
-                    if current >= data['price']:
-                        send_telegram(f"🔔 <b>ALARM — {ticker}</b>\nFiyat ${current:.2f} → Hedef ${data['price']} seviyesine ulaştı!", data['chat_id'])
-                        del alerts[ticker]
-                except:
-                    pass
-
-        except:
-            pass
-
-        time.sleep(300)
-
-# =====================
-# FLASK ROUTES
-# =====================
-
-@app.route("/")
-def home():
-    return jsonify({"status": "Hawk Signal Bot v2.0 🦅", "nasdaq": len(NASDAQ_LIST), "bist": len(BIST_LIST), "alman": len(ALMAN_LIST)})
-
-@app.route("/test")
-def test():
-    send_telegram("🦅 <b>Hawk Signal Bot v2.0 Aktif!</b>\n\n✅ NASDAQ, BIST, Alman Borsası\n✅ 3 Seans Sistemi\n✅ Manuel Komutlar\n✅ Portföy ve Alarm Takibi")
-    return jsonify({"status": "Test mesajı gönderildi!"})
-
-# =====================
-# WEBHOOK ROUTE
+# WEBHOOK
 # =====================
 
 @app.route("/webhook", methods=["POST"])
@@ -900,21 +695,85 @@ def webhook():
 
 @app.route("/set_webhook")
 def set_webhook():
-    url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
-    if not url:
+    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
+    if not domain:
         return jsonify({"error": "RAILWAY_PUBLIC_DOMAIN not set"})
-    webhook_url = f"https://{url}/webhook"
+    webhook_url = f"https://{domain}/webhook"
     r = requests.get(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook",
         params={"url": webhook_url}
     )
     return jsonify(r.json())
 
-def start_background():
-    threading.Thread(target=auto_scan_loop, daemon=True).start()
+@app.route("/")
+def home():
+    return jsonify({"status": "Hawk Signal Bot v3.0 🦅", "version": "5-kademe-filtre"})
 
-# Başlat
-start_background()
+@app.route("/test")
+def test():
+    send_telegram("🦅 <b>Hawk Signal Bot v3.0 Aktif!</b>\n\n✅ 5 Katmanlı Filtre\n✅ Dinamik Hacim Seçimi\n✅ Twelve Data entegrasyonu\n✅ NASDAQ, BIST, Alman")
+    return jsonify({"status": "Test mesajı gönderildi!"})
+
+# =====================
+# OTOMATİK TARAMA
+# =====================
+
+def is_nasdaq_hours():
+    now = datetime.utcnow()
+    return 12 <= now.hour <= 23
+
+def is_bist_hours():
+    now = datetime.utcnow()
+    h, m = now.hour, now.minute
+    if 7 <= h < 15:
+        if (h == 9 and m >= 30) or h == 10 or (h == 11 and m == 0):
+            return False
+        return True
+    return False
+
+def auto_scan_loop():
+    time.sleep(15)
+    send_telegram("🦅 <b>Hawk Signal Bot v3.0 Başladı!</b>\n\n✅ 5 Kademe Filtre Aktif\n✅ Dinamik hacim tabanlı hisse seçimi\n✅ 25 dakikada bir otomatik tarama")
+
+    while True:
+        try:
+            if is_nasdaq_hours():
+                batch = get_top_volume_stocks('nasdaq', 100, 30)
+                for ticker in batch:
+                    signal = analyze_stock(ticker, 'nasdaq')
+                    if signal:
+                        send_telegram(signal)
+                        time.sleep(3)
+                    time.sleep(1.2)
+
+            if is_bist_hours():
+                batch = get_top_volume_stocks('bist', 40, 15)
+                for ticker in batch:
+                    signal = analyze_stock(ticker, 'bist')
+                    if signal:
+                        send_telegram(signal)
+                        time.sleep(3)
+                    time.sleep(1.2)
+
+            for ticker, data in list(tracked.items()):
+                try:
+                    result = td_get_ohlcv(ticker, 'nasdaq', 5)
+                    if result:
+                        df, _ = result
+                        current = float(df['Close'].iloc[-1])
+                        if current <= data['stop']:
+                            send_telegram(f"🛑 <b>STOP — {ticker}</b>\n${current:.2f} → Stop ${data['stop']}", data['chat_id'])
+                        elif current >= data['target']:
+                            send_telegram(f"🎯 <b>HEDEF — {ticker}</b>\n${current:.2f} → Hedef ${data['target']}", data['chat_id'])
+                except:
+                    pass
+
+        except:
+            pass
+
+        time.sleep(1500)
+
+threading.Thread(target=auto_scan_loop, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
