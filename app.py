@@ -4,10 +4,12 @@ import requests
 import threading
 from flask import Flask, jsonify, request
 from datetime import datetime, timedelta
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import re
+
+import yfinance as yf
+yf.set_tz_cache_location("/tmp")
 
 app = Flask(__name__)
 
