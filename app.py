@@ -203,6 +203,71 @@ def calc_sma(series, period):
 def calc_ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
+def calc_atr(df, period=14):
+    """Average True Range - volatilite bazlı stop hesaplama için"""
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    return atr
+
+def calc_adx(df, period=14):
+    """Average Directional Index - trend gücü ölçümü"""
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm[plus_dm < 0] = 0
+    minus_dm[minus_dm < 0] = 0
+    plus_dm[(plus_dm - minus_dm) < 0] = 0
+    minus_dm[(minus_dm - plus_dm) < 0] = 0
+
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr = tr.rolling(period).mean()
+    plus_di = 100 * (plus_dm.rolling(period).mean() / atr)
+    minus_di = 100 * (minus_dm.rolling(period).mean() / atr)
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    adx = dx.rolling(period).mean()
+    return adx
+
+def get_index_performance(market, days=20):
+    """Endeks performansını çek (Relative Strength için)"""
+    try:
+        if market == 'nasdaq':
+            index_symbol = 'QQQ'
+        elif market == 'bist':
+            index_symbol = 'XU100'
+        elif market == 'alman':
+            index_symbol = 'DAX'
+        else:
+            return None
+
+        result = td_get_ohlcv(index_symbol, market, outputsize=days+5)
+        if result is None:
+            return None
+        df, _ = result
+        if len(df) < days:
+            return None
+
+        old_price = float(df['Close'].iloc[-days])
+        new_price = float(df['Close'].iloc[-1])
+        return (new_price - old_price) / old_price * 100
+    except:
+        return None
+
 # =====================
 # ANA ANALİZ (4 KADEME)
 # =====================
@@ -214,8 +279,11 @@ def analyze_stock(symbol, market):
             return None
         df, clean_symbol = result
 
-        if len(df) < 60:
+        data_days = len(df)
+        if data_days < 20:
             return None
+
+        low_data_warning = data_days < 60
 
         close = df['Close']
         volume = df['Volume']
@@ -223,9 +291,11 @@ def analyze_stock(symbol, market):
         rsi = calc_rsi(close)
         macd, macd_signal = calc_macd(close)
         ema20 = calc_ema(close, 20)
-        sma50 = calc_sma(close, 50)
-        sma200 = calc_sma(close, 200)
-        vol_ma20 = volume.rolling(20).mean()
+        sma50 = calc_sma(close, min(50, data_days-1))
+        sma200 = calc_sma(close, min(200, data_days-1))
+        vol_ma20 = volume.rolling(min(20, data_days-1)).mean()
+        atr = calc_atr(df, period=min(14, data_days-1))
+        adx = calc_adx(df, period=min(14, data_days-1))
 
         price = float(close.iloc[-1])
         rsi_now = float(rsi.iloc[-1])
@@ -235,10 +305,12 @@ def analyze_stock(symbol, market):
         macd_prev_val = float(macd.iloc[-2])
         macd_sig_prev = float(macd_signal.iloc[-2])
         ema20_now = float(ema20.iloc[-1])
-        sma50_now = float(sma50.iloc[-1])
-        sma200_now = float(sma200.iloc[-1])
+        sma50_now = float(sma50.iloc[-1]) if not pd.isna(sma50.iloc[-1]) else price
+        sma200_now = float(sma200.iloc[-1]) if not pd.isna(sma200.iloc[-1]) else price
         vol_now = float(volume.iloc[-1])
-        vol_avg = float(vol_ma20.iloc[-1])
+        vol_avg = float(vol_ma20.iloc[-1]) if not pd.isna(vol_ma20.iloc[-1]) else vol_now
+        atr_now = float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else price * 0.02
+        adx_now = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 20
 
         # KADEME 1: TREND
         trend_sma200 = "✅ Yukarıda" if price > sma200_now else "⚠️ Aşağıda"
@@ -254,11 +326,44 @@ def analyze_stock(symbol, market):
         macd_crossover = macd_prev_val < macd_sig_prev and macd_now > macd_sig_now
         macd_positive = macd_now > macd_sig_now
         vol_ratio = vol_now / vol_avg if vol_avg > 0 else 0
-
-        # KADEME 3: HACİM (5. kademe zaten hisse seçiminde uygulandı)
         vol_ok = vol_ratio >= 1.2
 
-        # KADEME 4: SKOR
+        # KADEME 3: ADX TREND GÜCÜ
+        strong_trend = adx_now >= 25
+        adx_text = f"✅ {adx_now:.0f} (Güçlü trend)" if strong_trend else f"⚠️ {adx_now:.0f} (Zayıf trend)"
+
+        # KADEME 4: RELATIVE STRENGTH
+        index_perf = get_index_performance(market, days=20)
+        stock_perf = None
+        rs_text = "➖ Veri yok"
+        rs_strong = False
+        try:
+            old_price = float(close.iloc[max(0,len(close)-20)])
+            stock_perf = (price - old_price) / old_price * 100
+            if index_perf is not None:
+                rs_diff = stock_perf - index_perf
+                rs_strong = rs_diff > 0
+                rs_text = f"✅ Endeksten +{rs_diff:.1f}% güçlü" if rs_strong else f"⚠️ Endeksten {rs_diff:.1f}% zayıf"
+        except:
+            pass
+
+        # KADEME 5: RSI/MACD UYUMSUZLUK
+        divergence_text = "➖ Tespit edilmedi"
+        try:
+            prices_10 = close.values[-10:]
+            rsi_10 = rsi.values[-10:]
+            p_low_idx = int(np.argmin(prices_10[:-1]))
+            p_high_idx = int(np.argmax(prices_10[:-1]))
+            bull_div = prices_10[-1] < prices_10[p_low_idx] and rsi_10[-1] > rsi_10[p_low_idx]
+            bear_div = prices_10[-1] > prices_10[p_high_idx] and rsi_10[-1] < rsi_10[p_high_idx]
+            if bull_div:
+                divergence_text = "🟢 Boğa Uyumsuzluğu - Yukarı dönüş sinyali"
+            elif bear_div:
+                divergence_text = "🔴 Ayı Uyumsuzluğu - Aşağı dönüş riski"
+        except:
+            pass
+
+        # SKOR HESAPLAMA
         score = 0
         if price > sma200_now: score += 2
         if price > sma50_now: score += 1
@@ -267,21 +372,28 @@ def analyze_stock(symbol, market):
         elif macd_positive: score += 1
         if rsi_signal: score += 2
         if vol_ok: score += 2
+        if strong_trend: score += 2
+        if rs_strong: score += 1
         if price < sma200_now: score -= 2
         if resistance_risk: score -= 2
+        if not strong_trend: score -= 1
 
-        if score < 6:
+        if score < 7:
             return None
 
         # RİSK
-        risk_score = max(10, min(90, 100 - (score * 10)))
+        risk_score = max(10, min(90, 100 - (score * 8)))
         risk_label = "Düşük 🟢" if risk_score < 30 else "Orta 🟡" if risk_score < 60 else "Yüksek 🔴"
 
-        # ÇIKIŞ STRATEJİSİ
+        # ATR BAZLI ÇIKIŞ STRATEJİSİ
         entry = price
         take_profit = round(entry * 1.05, 2)
-        support = max(ema20_now, sma50_now * 0.99)
-        stop_loss = round(min(support, entry * 0.97), 2)
+        atr_stop = round(entry - (atr_now * 1.8), 2)
+        pct_stop = round(entry * 0.97, 2)
+        stop_loss = round(max(atr_stop, pct_stop * 0.98), 2)
+        if stop_loss >= entry:
+            stop_loss = round(entry * 0.97, 2)
+
         risk_amt = round(entry - stop_loss, 2)
         reward_amt = round(take_profit - entry, 2)
         rr = round(reward_amt / risk_amt, 1) if risk_amt > 0 else 0
@@ -290,21 +402,23 @@ def analyze_stock(symbol, market):
         macd_text = "✅ Taze Crossover 🔥" if macd_crossover else "✅ Pozitif" if macd_positive else "⚠️ Negatif"
         rsi_text = f"✅ {rsi_now:.1f}" if rsi_signal else f"⚠️ {rsi_now:.1f}"
 
-        if score >= 8 and rr >= 2:
+        if score >= 9 and rr >= 1.5:
             karar = "💚 İŞLEME GİRİLEBİLİR"
-        elif score >= 6:
+        elif score >= 7:
             karar = "🟡 İZLEMEDE KALSIN"
         else:
             karar = "🔴 GEÇ"
 
         currency = "₺" if market == 'bist' else "€" if market == 'alman' else "$"
 
+        low_data_note = f"\n⚠️ Not: Sınırlı veri ({data_days} gün). Sonuçlar daha az güvenilir olabilir.\n" if low_data_warning else ""
+
         msg = f"""
 🚨 <b>{clean_symbol} - POTANSİYEL SİNYAL</b>
 ──────────────────────────
 📈 Giriş: <b>{currency}{entry:.2f}</b>
 🎯 Kar Al (%5): <b>{currency}{take_profit:.2f}</b>
-🛑 Zarar Kes: <b>{currency}{stop_loss:.2f}</b>
+🛑 Zarar Kes (ATR): <b>{currency}{stop_loss:.2f}</b>
 ⚖️ Risk/Ödül: <b>1:{rr}</b>
 
 📊 <b>Teknik Durum:</b>
@@ -313,11 +427,14 @@ def analyze_stock(symbol, market):
 • RSI: {rsi_text}
 • MACD: {macd_text}
 • Hacim: {vol_text}
+• ADX (Trend Gücü): {adx_text}
+• Relative Strength: {rs_text}
+• Uyumsuzluk: {divergence_text}
 
 ⚠️ <b>Risk:</b>
 • Direnç: {"⚠️ Kritik seviye yakın" if resistance_risk else "✅ Temiz"}
 • Risk Skoru: %{risk_score} - {risk_label}
-
+{low_data_note}
 💡 <b>Karar:</b> {karar}
 ⏰ {datetime.now().strftime('%d.%m.%Y %H:%M')}
 """
