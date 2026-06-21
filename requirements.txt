@@ -3,4 +3,4 @@ requests==2.31.0
 gunicorn==21.2.0
 pandas==2.2.3
 numpy==1.26.4
-tradingview-scraper
+tradingview-scraper==0.4.20
