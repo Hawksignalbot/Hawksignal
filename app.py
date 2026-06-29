@@ -1814,7 +1814,7 @@ Devam: Triangle, Flag, Rectangle
 (eş değer: /portföy, /portfolio, /portfolio add)
 
 ──────────────────────────
-ℹ️ For the English command list, type /help.""", chat_id)
+ℹ️ For the English command list, type /help""", chat_id)
         return
 
     if t.startswith('/help'):
