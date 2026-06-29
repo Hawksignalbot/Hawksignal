@@ -1814,7 +1814,7 @@ Devam: Triangle, Flag, Rectangle
 (eş değer: /portföy, /portfolio, /portfolio add)
 
 ──────────────────────────
-ℹ️ İngilizce komut listesi için /help yazabilirsin.""", chat_id)
+ℹ️ For the English command list, type /help.""", chat_id)
         return
 
     if t.startswith('/help'):
@@ -1880,7 +1880,7 @@ Continuation: Triangle, Flag, Rectangle
 (aliases: /portfoy, /portföy, /portfoy ekle)
 
 ──────────────────────────
-ℹ️ For the Turkish command list, type /yardim.""", chat_id)
+ℹ️ Türkçe komut listesi için /yardim yazabilirsin.""", chat_id)
         return
 
     if any(t.startswith(x) for x in ['/liste','/list']):
