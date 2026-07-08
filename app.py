@@ -26,6 +26,8 @@ CHAT_ID = os.environ.get("CHAT_ID")
 TD_API_KEY = os.environ.get("TD_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+GOOGLE_SHEETS_CREDENTIALS_JSON = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "12tBEKxu1tBMknB9A3EfpmXO8WVt2gpjbPA1mGqjJU6Q")
 
 # ===== 6 KANAL YAPISI =====
 # Her kategori için ayrı Telegram kanalı/grubu. Henüz ayarlanmamışsa (env
@@ -88,6 +90,15 @@ try:
     TV_SCRAPER_AVAILABLE = True
 except Exception:
     TV_SCRAPER_AVAILABLE = False
+
+# gspread (Google Sheets performans takibi için - opsiyonel, yoksa özellik
+# sessizce devre dışı kalır, botun geri kalanını etkilemez)
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials as _GoogleCredentials
+    GSPREAD_AVAILABLE = True
+except Exception:
+    GSPREAD_AVAILABLE = False
 
 # =====================
 # SEKTÖR HARİTASI (sinyal mesajında gösterilir)
@@ -561,6 +572,164 @@ def td_get_ohlcv(symbol, outputsize=210):
     except:
         last_ohlcv_source["source"] = "none"
         return None
+
+# =====================
+# PERFORMANS TAKİBİ (Google Sheets)
+# =====================
+# Trend Sinyali ve Erken Uyarı sinyallerinin gerçekte tuttuğunu objektif
+# ölçmek için: her sinyal kendi satırını alır (kendi giriş fiyatı, kendi
+# bağımsız 5 günlük takip penceresi). Aynı hisse ertesi gün tekrar sinyal
+# verirse YENİ ve ayrı bir satır açılır, önceki satır kendi döngüsünde
+# bağımsız devam eder.
+#
+# Sheet'in kendisi kalıcı depo olarak kullanılıyor (RAM/dosya kaybı riski
+# yok) — bot her yeniden başladığında sheet'ten okuyup kaldığı yerden
+# devam edebilir.
+PERFORMANCE_SHEET_HEADER = [
+    "Tarih", "Sembol", "Sinyal Tipi", "Giriş Fiyatı",
+    "Gün1 Max", "Gün2 Max", "Gün3 Max", "Gün4 Max", "Gün5 Max", "Hedef (%5)"
+]
+_gsheet_client_cache = {"client": None, "worksheet": None}
+
+def _get_performance_worksheet():
+    """
+    Google Sheets istemcisini ve çalışma sayfasını hazırlar (cache'lenir).
+    GOOGLE_SHEETS_CREDENTIALS_JSON tanımlı değilse None döner — özellik
+    sessizce devre dışı kalır, botun geri kalanını etkilemez.
+    """
+    if _gsheet_client_cache["worksheet"] is not None:
+        return _gsheet_client_cache["worksheet"]
+    if not GSPREAD_AVAILABLE or not GOOGLE_SHEETS_CREDENTIALS_JSON or not GOOGLE_SHEET_ID:
+        return None
+    try:
+        import json as _json
+
+        creds_dict = _json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = _GoogleCredentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(GOOGLE_SHEET_ID)
+        worksheet = sheet.sheet1
+
+        # Başlık satırı yoksa oluştur
+        first_row = worksheet.row_values(1)
+        if first_row != PERFORMANCE_SHEET_HEADER:
+            worksheet.update("A1", [PERFORMANCE_SHEET_HEADER])
+
+        _gsheet_client_cache["client"] = client
+        _gsheet_client_cache["worksheet"] = worksheet
+        return worksheet
+    except Exception as e:
+        print(f"[DEBUG _get_performance_worksheet] Google Sheets bağlantı hatası: {e}")
+        return None
+
+def append_performance_row(symbol, entry_price, signal_type):
+    """Yeni bir sinyal üretildiğinde tabloya yeni bağımsız satır ekler."""
+    try:
+        ws = _get_performance_worksheet()
+        if ws is None or entry_price is None:
+            return
+        today_str = get_us_eastern_now().strftime("%d.%m.%Y")
+        row = [today_str, symbol, signal_type, round(float(entry_price), 2), "", "", "", "", "", ""]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        print(f"[DEBUG append_performance_row] {symbol} eklendi ({signal_type}, giriş ${entry_price:.2f})")
+    except Exception as e:
+        print(f"[DEBUG append_performance_row] Hata: {e}")
+
+def update_daily_performance():
+    """
+    Her işlem günü kapanışından sonra bir kez çağrılır:
+    - Hâlâ takip penceresi açık olan (Hedef sütunu boş) her satır için
+      bugünün en yüksek (High) fiyatını bir sonraki boş Gün sütununa yazar.
+    - Fiyat giriş fiyatının %5 üstüne ulaştıysa hemen ✅ ile işaretler.
+    - 5. gün de dolduysa ve hedefe hiç ulaşılmadıysa ⛔ ile işaretler.
+    """
+    ws = _get_performance_worksheet()
+    if ws is None:
+        return
+    try:
+        all_rows = ws.get_all_values()
+    except Exception as e:
+        print(f"[DEBUG update_daily_performance] Sheet okunamadı: {e}")
+        return
+
+    if len(all_rows) <= 1:
+        return  # Sadece başlık var, takip edilecek satır yok
+
+    updates = []  # (row_index_1based, col_index_1based, value)
+    price_cache = {}
+
+    for i, row in enumerate(all_rows[1:], start=2):  # 1. satır başlık
+        try:
+            if len(row) < 10:
+                row = row + [""] * (10 - len(row))
+            symbol = row[1]
+            entry_price = float(row[3]) if row[3] else None
+            gun_values = row[4:9]  # Gün1..Gün5
+            hedef = row[9]
+
+            if not symbol or entry_price is None or hedef:
+                continue  # Zaten tamamlanmış ya da bozuk satır, atla
+
+            # İlk boş Gün sütununu bul
+            empty_idx = None
+            for gi, gv in enumerate(gun_values):
+                if not gv:
+                    empty_idx = gi
+                    break
+            if empty_idx is None:
+                continue  # 5 gün de dolu ama Hedef işaretlenmemiş (olmamalı), atla
+
+            if symbol not in price_cache:
+                df = td_get_ohlcv(symbol, outputsize=3)
+                price_cache[symbol] = float(df["High"].iloc[-1]) if df is not None and len(df) > 0 else None
+            today_high = price_cache[symbol]
+            if today_high is None:
+                continue  # Bugün için veri alınamadı, bir sonraki güne bırak
+
+            col_index = 5 + empty_idx  # Gün1 = E sütunu = 5. kolon (1-based)
+            updates.append((i, col_index, round(today_high, 2)))
+
+            target_price = entry_price * 1.05
+            already_hit = any(float(g) >= target_price for g in gun_values if g)
+            if today_high >= target_price and not already_hit:
+                updates.append((i, 10, "✅"))
+            elif empty_idx == 4:  # Gün5 de dolduruldu, hedefe hiç ulaşılmadı
+                updates.append((i, 10, "⛔"))
+        except Exception as e:
+            print(f"[DEBUG update_daily_performance] Satır {i} işlenirken hata: {e}")
+            continue
+
+    if not updates:
+        return
+    try:
+        cell_updates = [{"range": gspread.utils.rowcol_to_a1(r, c), "values": [[v]]} for r, c, v in updates]
+        ws.batch_update(cell_updates, value_input_option="USER_ENTERED")
+        print(f"[DEBUG update_daily_performance] {len(updates)} hücre güncellendi")
+    except Exception as e:
+        print(f"[DEBUG update_daily_performance] Toplu güncelleme hatası: {e}")
+
+_last_performance_update_date = {"date": None}
+
+def maybe_run_daily_performance_update():
+    """
+    Piyasa kapanışından (16:00 ET) sonra, o gün için henüz çalıştırılmadıysa
+    performans tablosunu bir kez günceller. auto_scan_loop'un her turunda
+    çağrılması güvenlidir — günde bir kereden fazla çalışmaz.
+    """
+    try:
+        et = get_us_eastern_now()
+        if et.weekday() >= 5:
+            return  # Hafta sonu
+        market_close_minutes = 16 * 60
+        et_time = et.hour * 60 + et.minute
+        today_str = et.strftime("%Y-%m-%d")
+        if et_time >= market_close_minutes and _last_performance_update_date["date"] != today_str:
+            update_daily_performance()
+            _last_performance_update_date["date"] = today_str
+    except Exception as e:
+        print(f"[DEBUG maybe_run_daily_performance_update] Hata: {e}")
+
 
 # =====================
 # GÖSTERGELER
@@ -1566,7 +1735,7 @@ def analyze_stock(symbol, df=None):
 💡 <b>Karar:</b> {karar}
 ⏰ {now_tr().strftime('%d.%m.%Y %H:%M')}
 """
-        return {"signal": msg, "info": None}
+        return {"signal": msg, "info": None, "entry_price": entry}
     except Exception as e:
         import traceback
         print(f"[DEBUG analyze_stock] {symbol}: {e}")
@@ -1824,7 +1993,7 @@ def early_warning_scan(symbol, df=None):
 
 ⚠️ Bu erken bir sinyal, ana trend filtresinden geçmemiştir. Dikkatli değerlendir.
 """
-        return {"signal": msg, "info": None}
+        return {"signal": msg, "info": None, "entry_price": price}
     except Exception as e:
         import traceback
         print(f"[DEBUG early_warning_scan] {symbol}: {e}")
@@ -2820,6 +2989,8 @@ def auto_scan_loop():
 
     while True:
         try:
+            maybe_run_daily_performance_update()
+
             if is_bot_active():
                 reset_sector_tracking()
                 batch = get_trading_pool(30)
@@ -2836,6 +3007,7 @@ def auto_scan_loop():
                     if result and result.get("signal"):
                         send_kanal(result["signal"], "trend")
                         send_news_for_signal(ticker, "Trend Sinyali")
+                        append_performance_row(ticker, result.get("entry_price"), "Trend Sinyali")
                         time.sleep(2)
                     time.sleep(0.5)
 
@@ -2845,6 +3017,7 @@ def auto_scan_loop():
                     if result and result.get("signal"):
                         send_kanal(result["signal"], "erkenuyari")
                         send_news_for_signal(ticker, "Erken Uyarı")
+                        append_performance_row(ticker, result.get("entry_price"), "Erken Uyarı")
                         time.sleep(2)
                     time.sleep(0.5)
 
