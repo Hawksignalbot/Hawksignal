@@ -1,7 +1,0 @@
-flask==3.0.0
-requests==2.32.4
-gunicorn==21.2.0
-pandas==2.2.3
-numpy==1.26.4
-tradingview-scraper==0.4.20
-deep-translator==1.11.4
