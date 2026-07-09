@@ -590,7 +590,7 @@ PERFORMANCE_SHEET_HEADER = [
     "Gün1 Max", "Gün2 Max", "Gün3 Max", "Gün4 Max", "Gün5 Max", "Hedef (%5)"
 ]
 _gsheet_client_cache = {"client": None, "worksheet": None}
-_day_group_cache = {"state": None}  # {"date": "08.07.2026", "start_row": 2}
+_last_date_cache = {"date": None}  # {"date": "08.07.2026"} - son yazılan tarih
 
 # Hücre biçim şablonları (Google Sheets API CellFormat)
 _FMT_CENTER = {"horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE"}
@@ -601,11 +601,31 @@ _FMT_GUN_HEDEF_TUTTU = {
     "horizontalAlignment": "RIGHT", "verticalAlignment": "MIDDLE",
     "textFormat": {"bold": True, "foregroundColor": {"red": 0.06, "green": 0.42, "blue": 0.13}}
 }
-_FMT_TARIH = {
-    "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
-    "backgroundColor": {"red": 0, "green": 0, "blue": 0},
-    "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}
+# Haftanın gününe göre tarih hücresi rengi (arka fon hep siyah, yazı rengi değişir)
+_TARIH_GUN_RENKLERI = {
+    0: (1.0, 1.0, 1.0),         # Pazartesi - beyaz
+    1: (0.133, 0.773, 0.369),  # Salı - yeşil
+    2: (0.937, 0.267, 0.267),  # Çarşamba - kırmızı/turuncu
+    3: (0.133, 0.827, 0.933),  # Perşembe - camgöbeği
+    4: (1.0, 0.922, 0.231),    # Cuma - sarı
+    5: (0.698, 0.4, 1.0),      # Cumartesi - mor
+    6: (0.549, 0.549, 0.549),  # Pazar - gri
 }
+
+def _get_tarih_format(et_dt):
+    """Tarih hücresi için gün bazlı renk formatı üretir (tatil günü ayrı ele alınır)."""
+    if is_market_holiday(et_dt):
+        return {
+            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+            "backgroundColor": {"red": 0.349, "green": 0.349, "blue": 0.349},
+            "textFormat": {"bold": True, "foregroundColor": {"red": 0, "green": 0, "blue": 0}}
+        }
+    r, g, b = _TARIH_GUN_RENKLERI.get(et_dt.weekday(), (1.0, 1.0, 1.0))
+    return {
+        "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+        "backgroundColor": {"red": 0, "green": 0, "blue": 0},
+        "textFormat": {"bold": True, "foregroundColor": {"red": r, "green": g, "blue": b}}
+    }
 
 def _get_performance_worksheet():
     """
@@ -643,87 +663,60 @@ def _get_performance_worksheet():
         print(f"[DEBUG _get_performance_worksheet] Google Sheets bağlantı hatası: {e}")
         return None
 
-def _get_day_group_state(ws):
+def _get_last_used_date(ws):
     """
-    Sheet'teki son gün grubunun (aynı tarihli, birleştirilmiş satır bloğu)
-    hangi satırdan başladığını ve tarihinin ne olduğunu bulur/cache'ler.
-    Bot yeniden başlasa bile sheet'in kendisinden okuyarak kaldığı yerden
-    devam edebilir.
+    Sheet'te en son yazılmış tarihi bulur/cache'ler (yeni bir güne
+    geçildiğinde ayraç satırı eklemek için kullanılır). Bot yeniden
+    başlasa bile sheet'in kendisinden okuyarak devam edebilir.
     """
-    if _day_group_cache["state"] is not None:
-        return _day_group_cache["state"]
+    if _last_date_cache["date"] is not None:
+        return _last_date_cache["date"]
     try:
         all_vals = ws.get_all_values()
     except Exception:
         all_vals = []
 
     last_date = None
-    start_row = None
-    if len(all_vals) > 1:
-        for i in range(len(all_vals), 1, -1):
-            row = all_vals[i - 1]
-            row = row + [""] * (10 - len(row))
-            if not any(c.strip() for c in row):
-                break  # Boşluk (ayraç) satırına ulaşıldı, grup burada bitiyor
-            tarih_cell = row[0].strip()
-            if tarih_cell:
-                last_date = tarih_cell
-            start_row = i
+    for row in reversed(all_vals[1:]):  # başlığı atla
+        if row and row[0].strip():
+            last_date = row[0].strip()
+            break
 
-    state = {"date": last_date, "start_row": start_row}
-    _day_group_cache["state"] = state
-    return state
+    _last_date_cache["date"] = last_date
+    return last_date
 
 def append_performance_row(symbol, entry_price, signal_type):
     """
     Yeni bir sinyal üretildiğinde tabloya yeni bağımsız satır ekler.
-    Aynı gün içindeki sinyaller aynı "gün bloğuna" (tarih hücresi
-    birleştirilmiş) eklenir; yeni bir güne geçildiğinde önce boş bir
-    ayraç satırı bırakılır ve tarih yalnızca o günün ilk satırına yazılır.
+    Tarih her satırda tekrar yazılır (kendi kutusunda ortalı, haftanın
+    gününe göre renkli). Farklı bir güne geçildiğinde önce boş bir
+    ayraç satırı bırakılır.
     """
     try:
         ws = _get_performance_worksheet()
         if ws is None or entry_price is None:
             return
-        today_str = get_us_eastern_now().strftime("%d.%m.%Y")
-        state = _get_day_group_state(ws)
+        et = get_us_eastern_now()
+        today_str = et.strftime("%d.%m.%Y")
+        last_date = _get_last_used_date(ws)
 
-        is_new_day = state["date"] != today_str
-        if is_new_day and state["date"] is not None:
+        if last_date is not None and last_date != today_str:
             ws.append_row([""] * 10, value_input_option="USER_ENTERED")  # gün arası boşluk
 
         all_vals = ws.get_all_values()
         new_row_index = len(all_vals) + 1
 
-        if is_new_day:
-            state["date"] = today_str
-            state["start_row"] = new_row_index
-            tarih_value = today_str
-        else:
-            tarih_value = ""  # aynı gün içinde tekrar yazılmaz
-
-        row = [tarih_value, symbol, signal_type, round(float(entry_price), 2), "", "", "", "", "", ""]
+        row = [today_str, symbol, signal_type, round(float(entry_price), 2), "", "", "", "", "", ""]
         ws.append_row(row, value_input_option="USER_ENTERED")
 
-        # Sadece yeni eklenen satırı formatla (önceki satırları yeniden
-        # formatlamak, olası bir "hedef tuttu" yeşilini silme riski taşır).
+        ws.format(f"A{new_row_index}", _get_tarih_format(et))
         ws.format(f"B{new_row_index}", _FMT_SEMBOL)
         ws.format(f"C{new_row_index}", _FMT_CENTER)
         ws.format(f"D{new_row_index}", _FMT_FIYAT_BOLD)
         ws.format(f"E{new_row_index}:I{new_row_index}", _FMT_GUN)
         ws.format(f"J{new_row_index}", _FMT_CENTER)
 
-        # Tarih hücresini (gerekirse birleştirerek) biçimlendir — bu, grup
-        # genişledikçe önceki satırların tarih hücresini de kapsar.
-        start_row = state["start_row"]
-        if new_row_index > start_row:
-            try:
-                ws.merge_cells(f"A{start_row}:A{new_row_index}")
-            except Exception as e:
-                print(f"[DEBUG append_performance_row] Birleştirme hatası: {e}")
-        ws.format(f"A{start_row}:A{new_row_index}" if new_row_index > start_row else f"A{start_row}", _FMT_TARIH)
-
-        _day_group_cache["state"] = state
+        _last_date_cache["date"] = today_str
         print(f"[DEBUG append_performance_row] {symbol} eklendi ({signal_type}, giriş ${entry_price:.2f})")
     except Exception as e:
         print(f"[DEBUG append_performance_row] Hata: {e}")
@@ -1696,7 +1689,7 @@ def analyze_stock(symbol, df=None):
         if resistance_risk: score -= 2
         if not strong_trend: score -= 1
 
-        if score < 7:
+        if score < 9:
             risk_score_i = max(10, min(90, 100 - (score * 8)))
             risk_label_i = "Düşük 🟢" if risk_score_i < 30 else "Orta 🟡" if risk_score_i < 60 else "Yüksek 🔴"
             vol_text_i = (
@@ -1719,7 +1712,7 @@ def analyze_stock(symbol, df=None):
             yorum_parcalari.append("trend gücü yeterli (ADX 25 üstü)" if strong_trend else "trend gücü zayıf (ADX 25 altı)")
             yorum_parcalari.append("MACD pozitif" if macd_positive else "MACD negatif")
             yorum_parcalari.append("hacim teyidi var" if vol_ok else "hacim teyidi yok")
-            ozet_i = f"Toplam skor {score}/14 (eşik: 7+) altında kaldı. " + ", ".join(yorum_parcalari) + ". Net bir TREND SİNYALİ için daha fazla kriterin aynı yönde hizalanması gerekiyor."
+            ozet_i = f"Toplam skor {score}/14 (eşik: 9+) altında kaldı. " + ", ".join(yorum_parcalari) + ". Net bir TREND SİNYALİ için daha fazla kriterin aynı yönde hizalanması gerekiyor."
 
             msg_info = f"""
 📊 <b>TREND SİNYALİ — Bilgi Amaçlı (Eşik Karşılanmadı)</b>
@@ -1744,7 +1737,7 @@ def analyze_stock(symbol, df=None):
 
 ☯️ Uyumsuzluk (Fiyat-RSI Çelişkisi): {divergence_text}
 
-📐 <b>Skor: {score}/14</b> (Sinyal eşiği: 7+)
+📐 <b>Skor: {score}/14</b> (Sinyal eşiği: 9+)
 🎲 Risk Skoru: %{risk_score_i} - {risk_label_i}
 {low_data_note_i}
 💬 <b>Özet:</b> {ozet_i}
@@ -1785,12 +1778,10 @@ def analyze_stock(symbol, df=None):
             else f"🪫 {rsi_now:.1f} / Ref: 40-65 arası → Bölge Dışı"
         )
 
-        if score >= 9 and rr >= 1.5:
+        if rr >= 1.5:
             karar = "💚 İŞLEME GİRİLEBİLİR"
-        elif score >= 7:
-            karar = "🟡 İZLEMEDE KALSIN"
         else:
-            karar = "🔴 GEÇ"
+            karar = "🟡 İZLEMEDE KALSIN"
 
         sector, sector_count = register_sector_signal(symbol)
         sector_text = f"🔥 {sector} sektöründen {sector_count}. sinyal" if sector_count >= 2 else f"📌 {sector} sektörü"
@@ -3060,17 +3051,19 @@ def get_market_status():
 def get_scan_interval_seconds():
     """
     Tarama sıklığını session_type'a göre belirler:
-    - early_wake (açılışa 2 saat var): 30 dakika
-    - premarket: 30 dakika
+    - early_wake (açılışa 2 saat var): 45 dakika
+    - premarket: 45 dakika
     - regular (normal seans): 30 dakika
-    - afterhours (kapanış sonrası): 30 dakika
+    - afterhours (kapanış sonrası): 45 dakika
     - sleep: bir sonraki kontrol için 10 dakika (zaten tarama yapılmaz, sadece tekrar uyanma kontrolü)
     """
     _, _, session_type = get_market_status()
     if session_type == "sleep":
         return 10 * 60
-    else:  # early_wake, premarket, regular, afterhours — artık hepsi aynı
+    elif session_type == "regular":
         return 30 * 60
+    else:  # early_wake, premarket, afterhours
+        return 45 * 60
 
 def is_nasdaq_hours():
     status, _, _ = get_market_status()
