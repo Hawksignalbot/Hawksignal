@@ -590,6 +590,22 @@ PERFORMANCE_SHEET_HEADER = [
     "Gün1 Max", "Gün2 Max", "Gün3 Max", "Gün4 Max", "Gün5 Max", "Hedef (%5)"
 ]
 _gsheet_client_cache = {"client": None, "worksheet": None}
+_day_group_cache = {"state": None}  # {"date": "08.07.2026", "start_row": 2}
+
+# Hücre biçim şablonları (Google Sheets API CellFormat)
+_FMT_CENTER = {"horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE"}
+_FMT_SEMBOL = {"horizontalAlignment": "LEFT", "verticalAlignment": "MIDDLE", "textFormat": {"bold": True}}
+_FMT_FIYAT_BOLD = {"horizontalAlignment": "RIGHT", "verticalAlignment": "MIDDLE", "textFormat": {"bold": True}}
+_FMT_GUN = {"horizontalAlignment": "RIGHT", "verticalAlignment": "MIDDLE"}
+_FMT_GUN_HEDEF_TUTTU = {
+    "horizontalAlignment": "RIGHT", "verticalAlignment": "MIDDLE",
+    "textFormat": {"bold": True, "foregroundColor": {"red": 0.06, "green": 0.42, "blue": 0.13}}
+}
+_FMT_TARIH = {
+    "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+    "backgroundColor": {"red": 0, "green": 0, "blue": 0},
+    "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}
+}
 
 def _get_performance_worksheet():
     """
@@ -615,6 +631,10 @@ def _get_performance_worksheet():
         first_row = worksheet.row_values(1)
         if first_row != PERFORMANCE_SHEET_HEADER:
             worksheet.update("A1", [PERFORMANCE_SHEET_HEADER])
+            worksheet.format("A1:J1", {
+                "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+                "textFormat": {"bold": True}
+            })
 
         _gsheet_client_cache["client"] = client
         _gsheet_client_cache["worksheet"] = worksheet
@@ -623,15 +643,87 @@ def _get_performance_worksheet():
         print(f"[DEBUG _get_performance_worksheet] Google Sheets bağlantı hatası: {e}")
         return None
 
+def _get_day_group_state(ws):
+    """
+    Sheet'teki son gün grubunun (aynı tarihli, birleştirilmiş satır bloğu)
+    hangi satırdan başladığını ve tarihinin ne olduğunu bulur/cache'ler.
+    Bot yeniden başlasa bile sheet'in kendisinden okuyarak kaldığı yerden
+    devam edebilir.
+    """
+    if _day_group_cache["state"] is not None:
+        return _day_group_cache["state"]
+    try:
+        all_vals = ws.get_all_values()
+    except Exception:
+        all_vals = []
+
+    last_date = None
+    start_row = None
+    if len(all_vals) > 1:
+        for i in range(len(all_vals), 1, -1):
+            row = all_vals[i - 1]
+            row = row + [""] * (10 - len(row))
+            if not any(c.strip() for c in row):
+                break  # Boşluk (ayraç) satırına ulaşıldı, grup burada bitiyor
+            tarih_cell = row[0].strip()
+            if tarih_cell:
+                last_date = tarih_cell
+            start_row = i
+
+    state = {"date": last_date, "start_row": start_row}
+    _day_group_cache["state"] = state
+    return state
+
 def append_performance_row(symbol, entry_price, signal_type):
-    """Yeni bir sinyal üretildiğinde tabloya yeni bağımsız satır ekler."""
+    """
+    Yeni bir sinyal üretildiğinde tabloya yeni bağımsız satır ekler.
+    Aynı gün içindeki sinyaller aynı "gün bloğuna" (tarih hücresi
+    birleştirilmiş) eklenir; yeni bir güne geçildiğinde önce boş bir
+    ayraç satırı bırakılır ve tarih yalnızca o günün ilk satırına yazılır.
+    """
     try:
         ws = _get_performance_worksheet()
         if ws is None or entry_price is None:
             return
         today_str = get_us_eastern_now().strftime("%d.%m.%Y")
-        row = [today_str, symbol, signal_type, round(float(entry_price), 2), "", "", "", "", "", ""]
+        state = _get_day_group_state(ws)
+
+        is_new_day = state["date"] != today_str
+        if is_new_day and state["date"] is not None:
+            ws.append_row([""] * 10, value_input_option="USER_ENTERED")  # gün arası boşluk
+
+        all_vals = ws.get_all_values()
+        new_row_index = len(all_vals) + 1
+
+        if is_new_day:
+            state["date"] = today_str
+            state["start_row"] = new_row_index
+            tarih_value = today_str
+        else:
+            tarih_value = ""  # aynı gün içinde tekrar yazılmaz
+
+        row = [tarih_value, symbol, signal_type, round(float(entry_price), 2), "", "", "", "", "", ""]
         ws.append_row(row, value_input_option="USER_ENTERED")
+
+        # Sadece yeni eklenen satırı formatla (önceki satırları yeniden
+        # formatlamak, olası bir "hedef tuttu" yeşilini silme riski taşır).
+        ws.format(f"B{new_row_index}", _FMT_SEMBOL)
+        ws.format(f"C{new_row_index}", _FMT_CENTER)
+        ws.format(f"D{new_row_index}", _FMT_FIYAT_BOLD)
+        ws.format(f"E{new_row_index}:I{new_row_index}", _FMT_GUN)
+        ws.format(f"J{new_row_index}", _FMT_CENTER)
+
+        # Tarih hücresini (gerekirse birleştirerek) biçimlendir — bu, grup
+        # genişledikçe önceki satırların tarih hücresini de kapsar.
+        start_row = state["start_row"]
+        if new_row_index > start_row:
+            try:
+                ws.merge_cells(f"A{start_row}:A{new_row_index}")
+            except Exception as e:
+                print(f"[DEBUG append_performance_row] Birleştirme hatası: {e}")
+        ws.format(f"A{start_row}:A{new_row_index}" if new_row_index > start_row else f"A{start_row}", _FMT_TARIH)
+
+        _day_group_cache["state"] = state
         print(f"[DEBUG append_performance_row] {symbol} eklendi ({signal_type}, giriş ${entry_price:.2f})")
     except Exception as e:
         print(f"[DEBUG append_performance_row] Hata: {e}")
@@ -641,7 +733,8 @@ def update_daily_performance():
     Her işlem günü kapanışından sonra bir kez çağrılır:
     - Hâlâ takip penceresi açık olan (Hedef sütunu boş) her satır için
       bugünün en yüksek (High) fiyatını bir sonraki boş Gün sütununa yazar.
-    - Fiyat giriş fiyatının %5 üstüne ulaştıysa hemen ✅ ile işaretler.
+    - Fiyat giriş fiyatının %5 üstüne ulaştıysa hemen ✅ ile işaretler ve
+      o günün hücresini koyu yeşil yapar.
     - 5. gün de dolduysa ve hedefe hiç ulaşılmadıysa ⛔ ile işaretler.
     """
     ws = _get_performance_worksheet()
@@ -656,7 +749,8 @@ def update_daily_performance():
     if len(all_rows) <= 1:
         return  # Sadece başlık var, takip edilecek satır yok
 
-    updates = []  # (row_index_1based, col_index_1based, value)
+    updates = []       # (row, col, value)
+    green_cells = []   # a1 aralıkları - hedefi tutan gün hücreleri
     price_cache = {}
 
     for i, row in enumerate(all_rows[1:], start=2):  # 1. satır başlık
@@ -669,32 +763,32 @@ def update_daily_performance():
             hedef = row[9]
 
             if not symbol or entry_price is None or hedef:
-                continue  # Zaten tamamlanmış ya da bozuk satır, atla
+                continue  # Zaten tamamlanmış, boşluk satırı ya da bozuk satır
 
-            # İlk boş Gün sütununu bul
             empty_idx = None
             for gi, gv in enumerate(gun_values):
                 if not gv:
                     empty_idx = gi
                     break
             if empty_idx is None:
-                continue  # 5 gün de dolu ama Hedef işaretlenmemiş (olmamalı), atla
+                continue
 
             if symbol not in price_cache:
                 df = td_get_ohlcv(symbol, outputsize=3)
                 price_cache[symbol] = float(df["High"].iloc[-1]) if df is not None and len(df) > 0 else None
             today_high = price_cache[symbol]
             if today_high is None:
-                continue  # Bugün için veri alınamadı, bir sonraki güne bırak
+                continue
 
-            col_index = 5 + empty_idx  # Gün1 = E sütunu = 5. kolon (1-based)
+            col_index = 5 + empty_idx  # Gün1 = E = 5. kolon (1-based)
             updates.append((i, col_index, round(today_high, 2)))
 
             target_price = entry_price * 1.05
             already_hit = any(float(g) >= target_price for g in gun_values if g)
             if today_high >= target_price and not already_hit:
                 updates.append((i, 10, "✅"))
-            elif empty_idx == 4:  # Gün5 de dolduruldu, hedefe hiç ulaşılmadı
+                green_cells.append(gspread.utils.rowcol_to_a1(i, col_index))
+            elif empty_idx == 4:
                 updates.append((i, 10, "⛔"))
         except Exception as e:
             print(f"[DEBUG update_daily_performance] Satır {i} işlenirken hata: {e}")
@@ -705,7 +799,9 @@ def update_daily_performance():
     try:
         cell_updates = [{"range": gspread.utils.rowcol_to_a1(r, c), "values": [[v]]} for r, c, v in updates]
         ws.batch_update(cell_updates, value_input_option="USER_ENTERED")
-        print(f"[DEBUG update_daily_performance] {len(updates)} hücre güncellendi")
+        for a1 in green_cells:
+            ws.format(a1, _FMT_GUN_HEDEF_TUTTU)
+        print(f"[DEBUG update_daily_performance] {len(updates)} hücre güncellendi ({len(green_cells)} hedef tuttu)")
     except Exception as e:
         print(f"[DEBUG update_daily_performance] Toplu güncelleme hatası: {e}")
 
