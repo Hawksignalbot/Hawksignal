@@ -2118,6 +2118,47 @@ def is_important_news(title, summary=""):
     ]
     return any(kw in text for kw in important_keywords)
 
+# Sıkılaştırılmış (test amaçlı) filtre — rutin/genel kelimeler çıkarılmış,
+# sadece gerçekten piyasayı hareket ettirebilecek büyük olaylar kalmış.
+# Şu an SADECE arka planda sessizce sayılıyor, gönderim davranışını
+# DEĞİŞTİRMİYOR — /debug/newsfilter üzerinden karşılaştırma yapılabilsin diye.
+STRICT_IMPORTANT_KEYWORDS = [
+    'earnings', 'revenue', 'profit', 'loss', 'beat', 'miss', 'guidance',
+    'quarterly', 'annual', 'eps', 'q1', 'q2', 'q3', 'q4',
+    'ceo', 'cfo', 'executive', 'resign', 'appoint', 'leadership',
+    'merger', 'acquisition', 'acquire', 'buyout', 'takeover', 'deal',
+    'lawsuit', 'sue', 'investigation', 'sec', 'ftc', 'doj', 'fine', 'penalty',
+    'fda', 'approval', 'approved', 'reject', 'clinical',
+    'bankruptcy', 'debt', 'layoff', 'restructur',
+    'buyback', 'dividend', 'split',
+    'upgrade', 'downgrade',
+    'recall',
+]
+
+def is_important_news_strict(title, summary=""):
+    text = (title + " " + summary).lower()
+    return any(kw in text for kw in STRICT_IMPORTANT_KEYWORDS)
+
+_news_filter_ab_test = {
+    "eski_kabul": 0,
+    "yeni_kabul": 0,
+    "toplam_taranan": 0,
+    "baslangic_zamani": None,
+}
+
+def _count_news_filter_test(title, summary):
+    """Her taranan haberi eski ve yeni filtreden geçirip sessizce sayar."""
+    if _news_filter_ab_test["baslangic_zamani"] is None:
+        _news_filter_ab_test["baslangic_zamani"] = now_tr().strftime("%d.%m.%Y %H:%M")
+    _news_filter_ab_test["toplam_taranan"] += 1
+    old_ok = is_important_news(title, summary)
+    new_ok = is_important_news_strict(title, summary)
+    if old_ok:
+        _news_filter_ab_test["eski_kabul"] += 1
+    if new_ok:
+        _news_filter_ab_test["yeni_kabul"] += 1
+    return old_ok
+
 NEWS_POSITIVE_KEYWORDS = [
     "beats", "beat estimates", "tops estimates", "surge", "surges", "soars",
     "record profit", "record revenue", "upgrade", "upgraded", "outperform",
@@ -2206,6 +2247,7 @@ def fetch_news_for_symbol(symbol, importance_filter=True, days_back=3):
         if not isinstance(items, list):
             return []
         results = []
+        max_raw = 5 if importance_filter else 20  # A/B test taraması için daha geniş ham örneklem
         for item in items:
             title = (item.get("headline") or "").strip()
             summary = (item.get("summary") or "").strip()
@@ -2222,7 +2264,7 @@ def fetch_news_for_symbol(symbol, importance_filter=True, days_back=3):
                 "date": date_str,
                 "id": item.get("id") or f"{symbol}:{title}",
             })
-            if len(results) >= 5:
+            if len(results) >= max_raw:
                 break
         return results
     except Exception as e:
@@ -2933,6 +2975,23 @@ def debug_chats():
     """
     return jsonify(known_chats)
 
+@app.route("/debug/newsfilter")
+def debug_newsfilter():
+    """
+    Haber filtresi A/B test sayaçlarını gösterir. Eski (mevcut, gevşek)
+    filtre ile yeni (sıkılaştırılmış, test amaçlı) filtrenin aynı ham
+    haber akışı üzerinde kaç haberi kabul ettiğini karşılaştırır.
+    Gönderim davranışını ETKİLEMEZ — sadece sessizce sayar.
+    """
+    stats = dict(_news_filter_ab_test)
+    eski = stats["eski_kabul"]
+    yeni = stats["yeni_kabul"]
+    if eski > 0:
+        stats["azalma_yuzdesi"] = round((1 - (yeni / eski)) * 100, 1)
+    else:
+        stats["azalma_yuzdesi"] = None
+    return jsonify(stats)
+
 @app.route("/set_webhook")
 def set_webhook():
     domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
@@ -3174,8 +3233,11 @@ def news_scan_loop():
             interval = get_scan_interval_seconds()
             if interval != 10 * 60:  # sleep modunda değilsek (piyasa tamamen kapalı değilse)
                 # 1) Piyasa geneli haberler
-                general_items = fetch_finnhub_general_news(importance_filter=True, max_items=15)
+                general_items = fetch_finnhub_general_news(importance_filter=False, max_items=50)
                 for item in general_items:
+                    old_ok = _count_news_filter_test(item["title"], item["summary"])
+                    if not old_ok:
+                        continue  # Mevcut (eski) filtre davranışı korunuyor
                     nid = item["id"]
                     if is_news_already_sent(nid):
                         continue
@@ -3192,8 +3254,11 @@ def news_scan_loop():
                 # 2) Ham havuzdaki (örneklemesiz) semboller için önemli haberler
                 raw_pool = get_raw_trading_pool()
                 for sym in raw_pool:
-                    items = fetch_news_for_symbol(sym, importance_filter=True, days_back=1)
+                    items = fetch_news_for_symbol(sym, importance_filter=False, days_back=1)
                     for item in items:
+                        old_ok = _count_news_filter_test(item["title"], item["summary"])
+                        if not old_ok:
+                            continue  # Mevcut (eski) filtre davranışı korunuyor
                         nid = item["id"]
                         if is_news_already_sent(nid):
                             continue
