@@ -2147,7 +2147,11 @@ _news_filter_ab_test = {
 }
 
 def _count_news_filter_test(title, summary):
-    """Her taranan haberi eski ve yeni filtreden geçirip sessizce sayar."""
+    """
+    Her taranan haberi eski ve yeni filtreden geçirip sessizce sayar.
+    Karşılaştırma için ikisi de sayılır, ama GÖSTERİM KARARI yeni
+    (sıkılaştırılmış) filtreye göre verilir — bu yüzden new_ok döner.
+    """
     if _news_filter_ab_test["baslangic_zamani"] is None:
         _news_filter_ab_test["baslangic_zamani"] = now_tr().strftime("%d.%m.%Y %H:%M")
     _news_filter_ab_test["toplam_taranan"] += 1
@@ -2157,7 +2161,7 @@ def _count_news_filter_test(title, summary):
         _news_filter_ab_test["eski_kabul"] += 1
     if new_ok:
         _news_filter_ab_test["yeni_kabul"] += 1
-    return old_ok
+    return new_ok
 
 NEWS_POSITIVE_KEYWORDS = [
     "beats", "beat estimates", "tops estimates", "surge", "surges", "soars",
@@ -2208,12 +2212,12 @@ def translate_and_interpret_news(title, summary, symbol):
         translated_title = GoogleTranslator(source="en", target="tr").translate(title) if title else ""
         translated_summary = GoogleTranslator(source="en", target="tr").translate(summary) if summary else ""
         if translated_title or translated_summary:
-            return f"{translated_title}\n{translated_summary}\n{emoji} {comment}"
+            return f"{translated_title}\n{translated_summary}\n\n{emoji} {comment}\n"
         print("[DEBUG translate_and_interpret_news] Çeviri boş döndü, İngilizce fallback")
     except Exception as e:
         print(f"[DEBUG translate_and_interpret_news] Exception: {e}")
     # Fallback: orijinal İngilizce (yine de sentiment emojisiyle)
-    return f"{title}\n{summary}\n{emoji} {comment}"
+    return f"{title}\n{summary}\n\n{emoji} {comment}\n"
 
 def fetch_news_for_symbol(symbol, importance_filter=True, days_back=3):
     """
@@ -2978,10 +2982,10 @@ def debug_chats():
 @app.route("/debug/newsfilter")
 def debug_newsfilter():
     """
-    Haber filtresi A/B test sayaçlarını gösterir. Eski (mevcut, gevşek)
-    filtre ile yeni (sıkılaştırılmış, test amaçlı) filtrenin aynı ham
-    haber akışı üzerinde kaç haberi kabul ettiğini karşılaştırır.
-    Gönderim davranışını ETKİLEMEZ — sadece sessizce sayar.
+    Haber filtresi karşılaştırma sayaçlarını gösterir. Gösterim kararı artık
+    YENİ (sıkılaştırılmış) filtreye göre veriliyor; eski (gevşek) filtrenin
+    aynı ham haber akışında kaç haberi kabul edeceği ise sadece burada,
+    sessizce sayılıyor (Telegram'a hiç gönderilmiyor) — karşılaştırma içindir.
     """
     stats = dict(_news_filter_ab_test)
     eski = stats["eski_kabul"]
@@ -3235,9 +3239,9 @@ def news_scan_loop():
                 # 1) Piyasa geneli haberler
                 general_items = fetch_finnhub_general_news(importance_filter=False, max_items=50)
                 for item in general_items:
-                    old_ok = _count_news_filter_test(item["title"], item["summary"])
-                    if not old_ok:
-                        continue  # Mevcut (eski) filtre davranışı korunuyor
+                    new_ok = _count_news_filter_test(item["title"], item["summary"])
+                    if not new_ok:
+                        continue  # Gösterim kararı YENİ (sıkılaştırılmış) filtreye göre veriliyor
                     nid = item["id"]
                     if is_news_already_sent(nid):
                         continue
@@ -3256,9 +3260,9 @@ def news_scan_loop():
                 for sym in raw_pool:
                     items = fetch_news_for_symbol(sym, importance_filter=False, days_back=1)
                     for item in items:
-                        old_ok = _count_news_filter_test(item["title"], item["summary"])
-                        if not old_ok:
-                            continue  # Mevcut (eski) filtre davranışı korunuyor
+                        new_ok = _count_news_filter_test(item["title"], item["summary"])
+                        if not new_ok:
+                            continue  # Gösterim kararı YENİ (sıkılaştırılmış) filtreye göre veriliyor
                         nid = item["id"]
                         if is_news_already_sent(nid):
                             continue
