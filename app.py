@@ -908,16 +908,39 @@ def get_weekly_rsi(symbol, df=None):
     except:
         return None
 
+_qqq_perf_cache = {}  # {days: {"value": float|None, "ts": epoch}}
+
 def get_qqq_performance(days=20):
+    """
+    QQQ (piyasa geneli referansı) performansını hesaplar.
+    - Sonuç 15 dakika cache'lenir: QQQ verisi tüm hisseler için ortak
+      olduğundan, her tek hisse taramasında yeniden çekmeye gerek yok
+      (gereksiz Twelve Data kotası tüketimini önler).
+    - last_ohlcv_source global değişkeni, bu çağrı yüzünden ana hissenin
+      gerçek veri kaynağı etiketini EZMESİN diye çağrı öncesi/sonrası
+      korunup geri yükleniyor.
+    """
+    now_ts = time.time()
+    cached = _qqq_perf_cache.get(days)
+    if cached and (now_ts - cached["ts"]) < 900:  # 15 dakika
+        return cached["value"]
+
+    saved_source = dict(last_ohlcv_source)
     try:
-        df = td_get_ohlcv('QQQ', outputsize=days+5)
+        df = td_get_ohlcv('QQQ', outputsize=days + 5)
         if df is None or len(df) < days:
-            return None
-        old_price = float(df['Close'].iloc[-days])
-        new_price = float(df['Close'].iloc[-1])
-        return (new_price - old_price) / old_price * 100
+            value = None
+        else:
+            old_price = float(df['Close'].iloc[-days])
+            new_price = float(df['Close'].iloc[-1])
+            value = (new_price - old_price) / old_price * 100
     except:
-        return None
+        value = None
+    finally:
+        last_ohlcv_source["source"] = saved_source["source"]  # ana hissenin etiketini geri yükle
+
+    _qqq_perf_cache[days] = {"value": value, "ts": now_ts}
+    return value
 
 # =====================
 # ELLİOTT DALGA SAYIMI
@@ -1784,7 +1807,7 @@ def analyze_stock(symbol, df=None):
             karar = "🟡 İZLEMEDE KALSIN"
 
         sector, sector_count = register_sector_signal(symbol)
-        sector_text = f"🔥 {sector} sektöründen {sector_count}. sinyal" if sector_count >= 2 else f"📌 {sector} sektörü"
+        sector_text = f"🔥 {sector} sektöründen {sector_count}. sinyal" if sector_count >= 3 else f"📌 {sector} sektörü"
         low_data_note = f"\n⚠️ Not: SMA200 güvenilir kaynaktan (Barchart) alınamadı, sınırlı veriden ({data_days} gün) tahmin edildi. Bu değer hatalı olabilir.\n" if low_data_warning else ""
 
         msg = f"""
