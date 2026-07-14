@@ -1917,6 +1917,7 @@ def analyze_stock(symbol, df=None):
 
 🎲 Risk Skoru: %{risk_score} - {risk_label}
 {low_data_note}
+
 💡 <b>Karar:</b> {karar}
 
 {get_ohlcv_source_label()}
