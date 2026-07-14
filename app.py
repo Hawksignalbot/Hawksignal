@@ -197,6 +197,12 @@ def get_sma200_barchart(symbol):
 portfolio = {}
 alerts = {}
 tracked = {}
+
+# Aynı sembol/sinyal tipinin ardışık taramalarda tekrar tekrar
+# gönderilmesini/Sheets'e loglanmasını önlemek için (CryptoHawk'taki
+# _recently_signaled mantığının NASDAQ karşılığı). Bellek-içi tutulur,
+# Railway yeniden başlayınca (deploy) sıfırlanır.
+_recently_signaled = set()
 known_chats = {}  # /debug/chats için: {chat_id: {"title":, "type":, "last_seen":, "last_text":}}
 session_sector_signals = {}
 news_archive = {}
@@ -1004,6 +1010,10 @@ def label_elliott_waves(pivots):
     - Dalga 2, Dalga 1'in başlangıcının altına (boğa) / üstüne (ayı) inmez
     - Dalga 3, Dalga 1'den daha uzundur (genelde en uzun dalga)
     - Dalga 4, Dalga 1'in zirvesiyle çakışmaz (overlap kuralı)
+    - FIBONACCI ORANLARI: Dalga 2'nin Dalga 1'i geri çekilme yüzdesi
+      (%38.2-78.6 aralığında) ve Dalga 4'ün Dalga 3'ü geri çekilme
+      yüzdesi (%14.6-61.8 aralığında) kontrol edilir — bu olmadan
+      "5 dalga" görünse bile gerçek Elliott analistleri buna güvenmez.
     Kurallara uyan en güncel 6 pivot bulunursa "5 dalga tamamlandı" önerisi yapılır.
     """
     if len(pivots) < 6:
@@ -1015,24 +1025,44 @@ def label_elliott_waves(pivots):
 
     if bullish:
         wave1 = p1 - p0
+        wave2 = p1 - p2
         wave3 = p3 - p2
+        wave4 = p3 - p4
         wave5 = p5 - p4
         rule_wave2 = p2 > p0          # Dalga 2, başlangıcın altına inmemeli
         rule_wave3_longest = wave3 > wave1 and wave3 > wave5
         rule_wave4_no_overlap = p4 > p1   # Dalga 4, Dalga 1 zirvesiyle çakışmamalı
-        valid = rule_wave2 and rule_wave3_longest and rule_wave4_no_overlap and p5 > p3
         direction_text = "⏫ YUKARI (🐂 Boğa Dürtüsü)"
         next_expectation = "5 dalga tamamlanmış görünüyor — ABC düzeltmesi (aşağı) beklenebilir"
     else:
         wave1 = p0 - p1
+        wave2 = p2 - p1
         wave3 = p2 - p3
+        wave4 = p4 - p3
         wave5 = p4 - p5
         rule_wave2 = p2 < p0
         rule_wave3_longest = wave3 > wave1 and wave3 > wave5
         rule_wave4_no_overlap = p4 < p1
-        valid = rule_wave2 and rule_wave3_longest and rule_wave4_no_overlap and p5 < p3
         direction_text = "⏬ AŞAĞI (🐻 Ayı Dürtüsü)"
         next_expectation = "5 dalga tamamlanmış görünüyor — ABC düzeltmesi (yukarı) beklenebilir"
+
+    wave2_retrace_pct = (wave2 / wave1 * 100) if wave1 > 0 else 0
+    wave4_retrace_pct = (wave4 / wave3 * 100) if wave3 > 0 else 0
+    rule_fib_wave2 = 38.2 <= wave2_retrace_pct <= 78.6
+    rule_fib_wave4 = 14.6 <= wave4_retrace_pct <= 61.8
+
+    valid = (
+        rule_wave2 and rule_wave3_longest and rule_wave4_no_overlap
+        and (p5 > p3 if bullish else p5 < p3)
+        and rule_fib_wave2 and rule_fib_wave4
+    )
+
+    fib_text = (
+        f"🌊 Fibonacci — Dalga 2 geri çekilme: %{wave2_retrace_pct:.0f} "
+        f"({'✅ 38.2-78.6 aralığında' if rule_fib_wave2 else '⛔ aralık dışı'})\n"
+        f"🌊 Fibonacci — Dalga 4 geri çekilme: %{wave4_retrace_pct:.0f} "
+        f"({'✅ 14.6-61.8 aralığında' if rule_fib_wave4 else '⛔ aralık dışı'})"
+    )
 
     return {
         'valid': valid,
@@ -1043,6 +1073,9 @@ def label_elliott_waves(pivots):
         'rule_wave2': rule_wave2,
         'rule_wave3_longest': rule_wave3_longest,
         'rule_wave4_no_overlap': rule_wave4_no_overlap,
+        'rule_fib_wave2': rule_fib_wave2,
+        'rule_fib_wave4': rule_fib_wave4,
+        'fib_text': fib_text,
     }
 
 def elliott_wave_analysis(symbol):
@@ -1090,7 +1123,8 @@ volatiliteli bir bantta hareket ettiği anlamına gelir.
         kural_text = (
             f"🌊 Dalga 2 kuralı: {'✅' if result['rule_wave2'] else '⛔'}\n"
             f"🌊 Dalga 3 en uzun: {'✅' if result['rule_wave3_longest'] else '⛔'}\n"
-            f"🌊 Dalga 4 çakışma yok: {'✅' if result['rule_wave4_no_overlap'] else '⛔'}"
+            f"🌊 Dalga 4 çakışma yok: {'✅' if result['rule_wave4_no_overlap'] else '⛔'}\n"
+            f"{result['fib_text']}"
         )
 
         if result['valid']:
@@ -1452,10 +1486,19 @@ def detect_formations(pivots, trend_direction=None):
 
     return list(set(found))
 
-def formation_analysis(symbol):
+def formation_analysis(symbol, for_auto=False):
     """
     /formasyon (ve eş değerleri: /formation /pattern) komutu için ana fonksiyon.
     Hem manuel tekil sorguda hem otomatik taramada kullanılır.
+
+    for_auto=True (otomatik tarama): sadece HACİM TEYİTLİ formasyonları
+    döner; DEVAM formasyonları (Triangle, Rectangle, Flag) ayrıca genel
+    trend yönüyle uyumlu olmalıdır. DÖNÜŞ formasyonları (H&S, Wedge,
+    Diamond, Three Drives) hacim teyidi yeterlidir (zaten trende karşı
+    olmaları beklendiği için trend uyumu aranmaz).
+
+    for_auto=False (manuel sorgu, varsayılan): tüm tespit edilenleri
+    hacim/trend durumuyla birlikte gösterir.
     """
     try:
         df = td_get_ohlcv(symbol, outputsize=150)
@@ -1470,8 +1513,32 @@ def formation_analysis(symbol):
         sma50_now = float(sma50.iloc[-1]) if not pd.isna(sma50.iloc[-1]) else price
         trend_direction = 'up' if price > sma50_now else 'down'
 
+        volume = df['Volume']
+        vol_ma20 = volume.rolling(min(20, len(df)-1)).mean()
+        vol_now = float(volume.iloc[-1])
+        vol_avg = float(vol_ma20.iloc[-1]) if not pd.isna(vol_ma20.iloc[-1]) else vol_now
+        vol_ratio = vol_now / vol_avg if vol_avg > 0 else 0
+        volume_confirmed = vol_ratio >= 1.3
+
         pivots = find_zigzag_pivots(df, pct_threshold=4.0)
         formations = detect_formations(pivots, trend_direction)
+
+        _CONTINUATION_KEYS = {'triangle', 'rectangle'}
+
+        if for_auto:
+            filtered = []
+            for key in formations:
+                if not volume_confirmed:
+                    continue
+                bilgi = FORMASYON_YON_BILGISI.get(key)
+                if not bilgi:
+                    continue
+                if key in _CONTINUATION_KEYS:
+                    beklenen_yon = 'up' if 'Yukarı' in bilgi.get('yon', '') else ('down' if 'Aşağı' in bilgi.get('yon', '') else None)
+                    if beklenen_yon is not None and beklenen_yon != trend_direction:
+                        continue
+                filtered.append(key)
+            formations = filtered
 
         if not formations:
             info = f"""
@@ -1497,10 +1564,12 @@ Rectangle) hiçbiri net şekilde tespit edilemedi.
                 continue
             yon = bilgi.get('yon', 'Belirsiz')
             not_text = bilgi.get('not', '')
+            hacim_durum = "✅ Hacim teyitli" if volume_confirmed else "⏳ Hacim teyidi yok (zayıf sinyal)"
             bloklar.append(
                 f"🔍 <b>{bilgi['isim']}</b>\n"
                 f"   📊 Kategori: {bilgi['kategori']} Formasyonu\n"
                 f"   🎯 Beklenen Yön: {yon}\n"
+                f"   {hacim_durum} ({vol_ratio:.1f}x ortalama)\n"
                 f"   📝 {not_text}"
             )
 
@@ -1699,18 +1768,25 @@ def analyze_stock(symbol, df=None):
             pass
 
         score = 0
-        if price > sma200_now: score += 2
         if price > sma50_now: score += 1
         if price > ema20_now: score += 1
         if macd_crossover: score += 3
         elif macd_positive: score += 1
         if rsi_signal: score += 2
-        if vol_ok: score += 2
+        if vol_ratio > 2.0: score += 4
+        elif vol_ratio > 1.5: score += 3
+        elif vol_ratio > 1.2: score += 2
+        elif vol_ratio > 1.05: score += 1
         if strong_trend: score += 2
         if rs_strong: score += 1
-        if price < sma200_now: score -= 2
         if resistance_risk: score -= 2
         if not strong_trend: score -= 1
+        # NOT: SMA200 artık puanlamaya dahil değil — CryptoHawk'ta
+        # kararlaştırıldığı gibi uzun vadeli rejim göstergesi olduğu
+        # için sadece bağlam notu (aşağıdaki trend_sma200 metni) olarak
+        # sunuluyor, skoru bozmuyor. Hacim ağırlığı bunun karşılığında
+        # 2'den 4'e çıkarıldı (kripto'daki "usta trader" mantığıyla
+        # tutarlı: hacimsiz hareketler en sık yalancı sinyal kaynağı).
 
         if score < 9:
             risk_score_i = max(10, min(90, 100 - (score * 8)))
@@ -1841,8 +1917,9 @@ def analyze_stock(symbol, df=None):
 
 🎲 Risk Skoru: %{risk_score} - {risk_label}
 {low_data_note}
-{get_ohlcv_source_label()}
 💡 <b>Karar:</b> {karar}
+
+{get_ohlcv_source_label()}
 ⏰ {now_tr().strftime('%d.%m.%Y %H:%M')}
 """
         return {"signal": msg, "info": None, "entry_price": entry}
@@ -3180,20 +3257,26 @@ def auto_scan_loop():
                 for ticker in batch:
                     result = analyze_stock(ticker)
                     if result and result.get("signal"):
-                        send_kanal(result["signal"], "trend")
-                        send_news_for_signal(ticker, "Trend Sinyali")
-                        append_performance_row(ticker, result.get("entry_price"), "Trend Sinyali")
-                        time.sleep(2)
+                        signal_key = f"trend:{ticker}"
+                        if signal_key not in _recently_signaled:
+                            _recently_signaled.add(signal_key)
+                            send_kanal(result["signal"], "trend")
+                            send_news_for_signal(ticker, "Trend Sinyali")
+                            append_performance_row(ticker, result.get("entry_price"), "Trend Sinyali")
+                            time.sleep(2)
                     time.sleep(0.5)
 
                 ew_batch = random.sample(batch, min(10, len(batch)))
                 for ticker in ew_batch:
                     result = early_warning_scan(ticker)
                     if result and result.get("signal"):
-                        send_kanal(result["signal"], "erkenuyari")
-                        send_news_for_signal(ticker, "Erken Uyarı")
-                        append_performance_row(ticker, result.get("entry_price"), "Erken Uyarı")
-                        time.sleep(2)
+                        signal_key = f"erkenuyari:{ticker}"
+                        if signal_key not in _recently_signaled:
+                            _recently_signaled.add(signal_key)
+                            send_kanal(result["signal"], "erkenuyari")
+                            send_news_for_signal(ticker, "Erken Uyarı")
+                            append_performance_row(ticker, result.get("entry_price"), "Erken Uyarı")
+                            time.sleep(2)
                     time.sleep(0.5)
 
                 # Elliott Dalga ve Formasyon taraması: kredi/worker yükünü
@@ -3202,17 +3285,23 @@ def auto_scan_loop():
                 for ticker in pattern_batch:
                     result = elliott_wave_analysis(ticker)
                     if result and result.get("signal"):
-                        send_kanal(result["signal"], "elliott")
-                        send_news_for_signal(ticker, "Elliott Dalga")
-                        time.sleep(2)
+                        signal_key = f"elliott:{ticker}"
+                        if signal_key not in _recently_signaled:
+                            _recently_signaled.add(signal_key)
+                            send_kanal(result["signal"], "elliott")
+                            send_news_for_signal(ticker, "Elliott Dalga")
+                            time.sleep(2)
                     time.sleep(0.5)
 
                 for ticker in pattern_batch:
-                    result = formation_analysis(ticker)
+                    result = formation_analysis(ticker, for_auto=True)
                     if result and result.get("signal"):
-                        send_kanal(result["signal"], "formasyon")
-                        send_news_for_signal(ticker, "Formasyon")
-                        time.sleep(2)
+                        signal_key = f"formasyon:{ticker}"
+                        if signal_key not in _recently_signaled:
+                            _recently_signaled.add(signal_key)
+                            send_kanal(result["signal"], "formasyon")
+                            send_news_for_signal(ticker, "Formasyon")
+                            time.sleep(2)
                     time.sleep(0.5)
 
             for ticker, data in list(tracked.items()):
