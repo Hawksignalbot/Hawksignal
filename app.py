@@ -1538,6 +1538,17 @@ def formation_analysis(symbol, for_auto=False):
                     if beklenen_yon is not None and beklenen_yon != trend_direction:
                         continue
                 filtered.append(key)
+
+            # Aynı anda birden fazla formasyon tespit edilmiş olabilir
+            # (geometrik olarak mümkün, "confluence" bazen daha güçlü bir
+            # sinyal sayılır) — ama karışıklığı önlemek için otomatik
+            # mesajda sadece TEK, en belirleyici formasyonu gösteriyoruz.
+            # Dönüş formasyonları devam formasyonlarından daha kararlı
+            # kabul edilir, öncelik onlara verilir.
+            if len(filtered) > 1:
+                reversal_first = [k for k in filtered if k not in _CONTINUATION_KEYS]
+                filtered = [reversal_first[0]] if reversal_first else [filtered[0]]
+
             formations = filtered
 
         if not formations:
@@ -1890,6 +1901,7 @@ def analyze_stock(symbol, df=None):
 📊 <b>TREND SİNYALİ — Mevcut Güçlü Trend</b>
 🚨 <b>{symbol} - POTANSİYEL SİNYAL</b>
 🦅 Sektör: {sector_text}
+💲 Güncel Fiyat: ${price:.2f}
 ──────────────────────────
 📈 Giriş: <b>${entry:.2f}</b>
 🎯 Kar Al (%5): <b>${take_profit:.2f}</b>
@@ -2912,10 +2924,10 @@ important news (earnings, CEO, merger, etc.) is automatically attached.
 
             lines = []
             lines.append(f"📈 <b>GÜNÜN EN ÇOK KAZANANLARI</b>")
-            lines.append(f"🕐 {now_tr().strftime('%d.%m.%Y %H:%M')}")
-            lines.append("──────────────────────────")
-            lines.append(f"{'Hisse':<6} {'Kazanç':>7} {'Dolar Hacmi':>12} {'Adet':>10}")
-            lines.append("──────────────────────────")
+            lines.append(f"<b>🕐 {now_tr().strftime('%d.%m.%Y %H:%M')}</b>")
+            lines.append("<b>──────────────────────────</b>")
+            lines.append(f"<b>{'Hisse':<6} {'Kazanç':>7} {'Dolar Hacmi':>12} {'Adet':>10}</b>")
+            lines.append("<b>──────────────────────────</b>")
 
             for i, g in enumerate(gainers, 1):
                 symbol = g['symbol']
