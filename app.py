@@ -2658,7 +2658,7 @@ important news (earnings, CEO, merger, etc.) is automatically attached.
         return
 
     if any(t.startswith(x) for x in ['/liste','/list']):
-        send_telegram(f"📋 <b>HAVUZ DURUMU</b>\n\n{get_source_label()}\nSon sayı: {last_pool_source['count']} hisse\nTarayıcı kütüphanesi: {'Aktif ✅' if TV_SCRAPER_AVAILABLE else 'Yok, yedek modda ⚠️'}", chat_id)
+        send_telegram(f"📋 <b>HAVUZ DURUMU</b>\n\n{get_source_label()}\nSon sayı: {last_pool_source['count']} hisse", chat_id)
         return
 
     # TREND TARAMASI
@@ -3123,7 +3123,7 @@ def home():
 
 @app.route("/test")
 def test():
-    send_telegram(f"🦅 <b>Hawk Signal Bot Aktif!</b>\n\n✅ Canlı piyasa taraması\n✅ Erken Uyarı Sistemi (7 kriter)\n✅ Haber entegrasyonu\n\nTarayıcı kütüphanesi: {'Aktif ✅' if TV_SCRAPER_AVAILABLE else 'Yedek modda ⚠️'}")
+    send_telegram(f"🦅 <b>Hawk Signal Bot Aktif!</b>\n\n✅ Canlı piyasa taraması\n✅ Erken Uyarı Sistemi (7 kriter)\n✅ Haber entegrasyonu")
     return jsonify({"status": "Test mesajı gönderildi!"})
 
 # =====================
@@ -3250,7 +3250,7 @@ def is_bot_active():
 
 def auto_scan_loop():
     time.sleep(15)
-    send_telegram(f"🦅 <b>Hawk Signal Bot — NASDAQ</b>\n\n✅ Canlı piyasa taraması\n✅ Trend + Erken Uyarı sistemleri aktif\n✅ Seans içi ve kapanış sonrası 30 dk aralıkla otomatik tarama\n\nTarayıcı kütüphanesi: {'Aktif ✅' if TV_SCRAPER_AVAILABLE else 'Yedek modda ⚠️'}", HAWK_GROUP_CHAT_ID, THREAD_ID_SISTEM)
+    send_telegram(f"🦅 <b>Hawk Signal Bot — NASDAQ</b>\n\n✅ Canlı piyasa taraması\n✅ Trend + Erken Uyarı sistemleri aktif\n✅ Seans içi ve kapanış sonrası 30 dk aralıkla otomatik tarama", HAWK_GROUP_CHAT_ID, THREAD_ID_SISTEM)
 
     while True:
         try:
