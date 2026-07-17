@@ -789,10 +789,11 @@ def update_daily_performance():
                 continue
 
             if symbol not in price_cache:
-                df = td_get_ohlcv(symbol, outputsize=3)
+                df = td_get_ohlcv(symbol, outputsize=25)  # td_get_ohlcv >=20 satır şartı için 3 yerine 25
                 price_cache[symbol] = float(df["High"].iloc[-1]) if df is not None and len(df) > 0 else None
             today_high = price_cache[symbol]
             if today_high is None:
+                print(f"[DEBUG update_daily_performance] {symbol}: güncel fiyat alınamadı, bu satır bu turda atlandı.")
                 continue
 
             col_index = 5 + empty_idx  # Gün1 = E = 5. kolon (1-based)
