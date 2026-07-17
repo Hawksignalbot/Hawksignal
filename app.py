@@ -821,6 +821,105 @@ def update_daily_performance():
     except Exception as e:
         print(f"[DEBUG update_daily_performance] Toplu güncelleme hatası: {e}")
 
+def resort_performance_sheet():
+    """
+    Performans tablosunu ANA sırada tarihe (kronolojik), her tarihin
+    kendi içinde İKİNCİL sırada sembole (alfabetik) göre yeniden dizer.
+    Farklı günler arasındaki boş ayraç satırı korunur/yeniden oluşturulur.
+    "Hedef tuttu" (yeşil) hücre biçimi de doğru gün sütununa yeniden
+    uygulanır. Tamamen otomatik çalışır, manuel müdahale gerekmez.
+    """
+    ws = _get_performance_worksheet()
+    if ws is None:
+        return
+    try:
+        all_rows = ws.get_all_values()
+    except Exception as e:
+        print(f"[DEBUG resort_performance_sheet] Sheet okunamadı: {e}")
+        return
+
+    if len(all_rows) <= 2:
+        return  # Sıralanacak yeterli veri yok
+
+    data_rows = []
+    for row in all_rows[1:]:
+        if row and any(cell.strip() for cell in row if isinstance(cell, str)):
+            padded = row + [""] * (10 - len(row)) if len(row) < 10 else row[:10]
+            data_rows.append(padded)
+
+    if not data_rows:
+        return
+
+    def _parse_tarih(tarih_str):
+        try:
+            return datetime.strptime(tarih_str, "%d.%m.%Y")
+        except Exception:
+            return datetime.max  # bozuk/boş tarih varsa en sona at
+
+    # ANA sıra: tarih (kronolojik) — İKİNCİL sıra: sembol (alfabetik)
+    data_rows.sort(key=lambda r: (_parse_tarih(r[0]), r[1]))
+
+    # Zaten sıralıysa gereksiz yazma yapma (API kotasını korumak için)
+    already_sorted_rows = []
+    last_date = None
+    for row in all_rows[1:]:
+        if row and any(cell.strip() for cell in row if isinstance(cell, str)):
+            already_sorted_rows.append(row + [""] * (10 - len(row)) if len(row) < 10 else row[:10])
+    if already_sorted_rows == data_rows:
+        return
+
+    # Günler arasına boş ayraç satırı ekleyerek son listeyi oluştur
+    final_rows = []
+    last_date = None
+    for row in data_rows:
+        current_date = row[0]
+        if last_date is not None and current_date != last_date:
+            final_rows.append([""] * 10)
+        final_rows.append(row)
+        last_date = current_date
+
+    try:
+        # Mevcut veri alanını temizle, sıralı hâliyle yeniden yaz
+        ws.batch_clear([f"A2:J{len(all_rows) + 5}"])
+        ws.update(f"A2:J{len(final_rows) + 1}", final_rows, value_input_option="USER_ENTERED")
+
+        for idx, row in enumerate(final_rows, start=2):
+            if not any(cell.strip() for cell in row if isinstance(cell, str)):
+                continue  # boş ayraç satırı, biçim gerekmiyor
+            try:
+                dt = datetime.strptime(row[0], "%d.%m.%Y")
+            except Exception:
+                continue
+
+            ws.format(f"A{idx}", _get_tarih_format(dt))
+            ws.format(f"B{idx}", _FMT_SEMBOL)
+            ws.format(f"C{idx}", _FMT_CENTER)
+            ws.format(f"D{idx}", _FMT_FIYAT_BOLD)
+            ws.format(f"E{idx}:I{idx}", _FMT_GUN)
+            ws.format(f"J{idx}", _FMT_CENTER)
+
+            if row[9] == "✅":
+                try:
+                    entry_price = float(row[3])
+                    target_price = entry_price * 1.05
+                    hit_col = None
+                    for gi in range(5):
+                        gv = row[4 + gi]
+                        if gv and float(gv) >= target_price:
+                            hit_col = gi
+                            break
+                    if hit_col is not None:
+                        col_letter = gspread.utils.rowcol_to_a1(idx, 5 + hit_col)
+                        ws.format(col_letter, _FMT_GUN_HEDEF_TUTTU)
+                except Exception:
+                    pass
+
+        _last_date_cache["date"] = final_rows[-1][0] if final_rows and any(c.strip() for c in final_rows[-1] if isinstance(c, str)) else _last_date_cache["date"]
+        print(f"[DEBUG resort_performance_sheet] {len(final_rows)} satır tarih+alfabetik sıraya dizildi.")
+    except Exception as e:
+        print(f"[DEBUG resort_performance_sheet] Yazma hatası: {e}")
+
+
 _last_performance_update_date = {"date": None}
 
 def maybe_run_daily_performance_update():
@@ -838,6 +937,7 @@ def maybe_run_daily_performance_update():
         today_str = et.strftime("%Y-%m-%d")
         if et_time >= market_close_minutes and _last_performance_update_date["date"] != today_str:
             update_daily_performance()
+            resort_performance_sheet()
             _last_performance_update_date["date"] = today_str
     except Exception as e:
         print(f"[DEBUG maybe_run_daily_performance_update] Hata: {e}")
