@@ -697,11 +697,19 @@ def append_performance_row(symbol, entry_price, signal_type):
     Tarih her satırda tekrar yazılır (kendi kutusunda ortalı, haftanın
     gününe göre renkli). Farklı bir güne geçildiğinde önce boş bir
     ayraç satırı bırakılır.
+
+    KALICI DEDUP: Aynı sembol + sinyal tipi BUGÜN zaten loglanmışsa
+    tekrar satır eklenmez. Bu kontrol Sheets'in kendisine bakarak
+    yapılır (bellek-içi değil) — Railway restart/redeploy sonrası bile
+    çalışmaya devam eder, tekrar tekrar loglama sorununu kalıcı olarak
+    çözer.
+
+    Dönüş: True (yeni satır eklendi) / False (zaten vardı, atlandı veya hata).
     """
     try:
         ws = _get_performance_worksheet()
         if ws is None or entry_price is None:
-            return
+            return False
         et = get_us_eastern_now()
         today_str = et.strftime("%d.%m.%Y")
         last_date = _get_last_used_date(ws)
@@ -710,6 +718,12 @@ def append_performance_row(symbol, entry_price, signal_type):
             ws.append_row([""] * 10, value_input_option="USER_ENTERED")  # gün arası boşluk
 
         all_vals = ws.get_all_values()
+
+        for row in all_vals[1:]:
+            if len(row) >= 3 and row[0] == today_str and row[1] == symbol and row[2] == signal_type:
+                print(f"[DEBUG append_performance_row] {symbol} ({signal_type}) bugün zaten loglanmış, atlandı.")
+                return False
+
         new_row_index = len(all_vals) + 1
 
         row = [today_str, symbol, signal_type, round(float(entry_price), 2), "", "", "", "", "", ""]
@@ -724,8 +738,10 @@ def append_performance_row(symbol, entry_price, signal_type):
 
         _last_date_cache["date"] = today_str
         print(f"[DEBUG append_performance_row] {symbol} eklendi ({signal_type}, giriş ${entry_price:.2f})")
+        return True
     except Exception as e:
         print(f"[DEBUG append_performance_row] Hata: {e}")
+        return False
 
 def update_daily_performance():
     """
@@ -3272,10 +3288,15 @@ def auto_scan_loop():
                     if result and result.get("signal"):
                         signal_key = f"trend:{ticker}"
                         if signal_key not in _recently_signaled:
+                            # Sheets'e loglama (kalıcı dedup) Telegram gönderiminden
+                            # ÖNCE yapılır — Sheets zaten "bugün loglanmış" derse
+                            # (örn. Railway restart sonrası bellek sıfırlanmış olsa
+                            # bile) Telegram'a da tekrar mesaj gitmez.
+                            logged = append_performance_row(ticker, result.get("entry_price"), "Trend Sinyali")
+                            if logged:
+                                send_kanal(result["signal"], "trend")
+                                send_news_for_signal(ticker, "Trend Sinyali")
                             _recently_signaled.add(signal_key)
-                            send_kanal(result["signal"], "trend")
-                            send_news_for_signal(ticker, "Trend Sinyali")
-                            append_performance_row(ticker, result.get("entry_price"), "Trend Sinyali")
                             time.sleep(2)
                     time.sleep(0.5)
 
@@ -3285,10 +3306,11 @@ def auto_scan_loop():
                     if result and result.get("signal"):
                         signal_key = f"erkenuyari:{ticker}"
                         if signal_key not in _recently_signaled:
+                            logged = append_performance_row(ticker, result.get("entry_price"), "Erken Uyarı")
+                            if logged:
+                                send_kanal(result["signal"], "erkenuyari")
+                                send_news_for_signal(ticker, "Erken Uyarı")
                             _recently_signaled.add(signal_key)
-                            send_kanal(result["signal"], "erkenuyari")
-                            send_news_for_signal(ticker, "Erken Uyarı")
-                            append_performance_row(ticker, result.get("entry_price"), "Erken Uyarı")
                             time.sleep(2)
                     time.sleep(0.5)
 
