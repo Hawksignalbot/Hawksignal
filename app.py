@@ -883,6 +883,11 @@ def resort_performance_sheet():
         ws.batch_clear([f"A2:J{len(all_rows) + 5}"])
         ws.update(f"A2:J{len(final_rows) + 1}", final_rows, value_input_option="USER_ENTERED")
 
+        # Tüm biçimlendirmeyi TEK bir toplu istekte gönderiyoruz (satır
+        # başına ayrı ayrı .format() çağırmak yüzlerce/binlerce API isteğine
+        # yol açıp Google Sheets kotasını tüketiyordu — bu da botun diğer
+        # Sheets işlemlerinin de başarısız olmasına neden olabiliyordu).
+        format_requests = []
         for idx, row in enumerate(final_rows, start=2):
             if not any(cell.strip() for cell in row if isinstance(cell, str)):
                 continue  # boş ayraç satırı, biçim gerekmiyor
@@ -891,31 +896,30 @@ def resort_performance_sheet():
             except Exception:
                 continue
 
-            ws.format(f"A{idx}", _get_tarih_format(dt))
-            ws.format(f"B{idx}", _FMT_SEMBOL)
-            ws.format(f"C{idx}", _FMT_CENTER)
-            ws.format(f"D{idx}", _FMT_FIYAT_BOLD)
-            ws.format(f"E{idx}:I{idx}", _FMT_GUN)
-            ws.format(f"J{idx}", _FMT_CENTER)
+            format_requests.append({"range": f"A{idx}", "format": _get_tarih_format(dt)})
+            format_requests.append({"range": f"B{idx}", "format": _FMT_SEMBOL})
+            format_requests.append({"range": f"C{idx}", "format": _FMT_CENTER})
+            format_requests.append({"range": f"D{idx}", "format": _FMT_FIYAT_BOLD})
+            format_requests.append({"range": f"E{idx}:I{idx}", "format": _FMT_GUN})
+            format_requests.append({"range": f"J{idx}", "format": _FMT_CENTER})
 
             if row[9] == "✅":
                 try:
                     entry_price = float(row[3])
                     target_price = entry_price * 1.05
-                    hit_col = None
                     for gi in range(5):
                         gv = row[4 + gi]
                         if gv and float(gv) >= target_price:
-                            hit_col = gi
+                            col_letter = gspread.utils.rowcol_to_a1(idx, 5 + gi)
+                            format_requests.append({"range": col_letter, "format": _FMT_GUN_HEDEF_TUTTU})
                             break
-                    if hit_col is not None:
-                        col_letter = gspread.utils.rowcol_to_a1(idx, 5 + hit_col)
-                        ws.format(col_letter, _FMT_GUN_HEDEF_TUTTU)
                 except Exception:
                     pass
 
-        _last_date_cache["date"] = final_rows[-1][0] if final_rows and any(c.strip() for c in final_rows[-1] if isinstance(c, str)) else _last_date_cache["date"]
-        print(f"[DEBUG resort_performance_sheet] {len(final_rows)} satır tarih+alfabetik sıraya dizildi.")
+        if format_requests:
+            ws.batch_format(format_requests)
+
+        print(f"[DEBUG resort_performance_sheet] {len(final_rows)} satır tarih+alfabetik sıraya dizildi ({len(format_requests)} biçim tek istekte gönderildi).")
     except Exception as e:
         print(f"[DEBUG resort_performance_sheet] Yazma hatası: {e}")
 
@@ -936,9 +940,18 @@ def maybe_run_daily_performance_update():
         et_time = et.hour * 60 + et.minute
         today_str = et.strftime("%Y-%m-%d")
         if et_time >= market_close_minutes and _last_performance_update_date["date"] != today_str:
-            update_daily_performance()
-            resort_performance_sheet()
+            # Tarihi HEMEN işaretle — update_daily_performance/resort_performance_sheet
+            # içeride hata verse bile bu turda tekrar tekrar denenip API kotasını
+            # tüketmesin diye (günde en fazla 1 deneme garantisi).
             _last_performance_update_date["date"] = today_str
+            try:
+                update_daily_performance()
+            except Exception as e:
+                print(f"[DEBUG maybe_run_daily_performance_update] update_daily_performance hatası: {e}")
+            try:
+                resort_performance_sheet()
+            except Exception as e:
+                print(f"[DEBUG maybe_run_daily_performance_update] resort_performance_sheet hatası: {e}")
     except Exception as e:
         print(f"[DEBUG maybe_run_daily_performance_update] Hata: {e}")
 
