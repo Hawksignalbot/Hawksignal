@@ -745,12 +745,23 @@ def append_performance_row(symbol, entry_price, signal_type):
 
 def update_daily_performance():
     """
-    Her işlem günü kapanışından sonra bir kez çağrılır:
-    - Hâlâ takip penceresi açık olan (Hedef sütunu boş) her satır için
-      bugünün en yüksek (High) fiyatını bir sonraki boş Gün sütununa yazar.
-    - Fiyat giriş fiyatının %5 üstüne ulaştıysa hemen ✅ ile işaretler ve
-      o günün hücresini koyu yeşil yapar.
-    - 5. gün de dolduysa ve hedefe hiç ulaşılmadıysa ⛔ ile işaretler.
+    Her işlem günü kapanışından sonra bir kez çağrılır. Her açık satır
+    (Hedef sütunu boş) için, GERÇEK giriş tarihinden (Tarih sütunu)
+    itibaren geçen işlem günü sayısına göre Gün1-5 sütunlarını DOĞRU
+    tarihsel Yüksek (High) fiyatlarıyla doldurur.
+
+    ÖNEMLİ: Artık "bugünün fiyatı" her satırın bir sonraki boş sütununa
+    körlemesine yazılmıyor — hangi Gün sütunu hangi takvim gününe denk
+    geliyorsa, o günün gerçek tarihsel OHLCV verisi kullanılıyor
+    (entry_date + N. işlem günü). Bu sayede bot bir süre çalışmasa bile
+    (ör. Railway hesabının dondurulması) tekrar başladığında atlanan
+    günler otomatik ve doğru şekilde geriye dönük tamamlanır (backfill) —
+    ayrı bir manuel müdahaleye gerek kalmaz.
+
+    - Fiyat giriş fiyatının %5 üstüne ulaştıysa ✅ ile işaretlenir ve o
+      günün hücresi koyu yeşil yapılır; hedef tutan günden sonrası
+      doldurulmaz (satır kapanır).
+    - 5. gün de dolduysa ve hedefe hiç ulaşılmadıysa ⛔ ile işaretlenir.
     """
     ws = _get_performance_worksheet()
     if ws is None:
@@ -766,46 +777,71 @@ def update_daily_performance():
 
     updates = []       # (row, col, value)
     green_cells = []   # a1 aralıkları - hedefi tutan gün hücreleri
-    price_cache = {}
+    ohlcv_cache = {}   # symbol -> df (bu turda semboller arası tekrar çekmemek için)
+    today_et_date = get_us_eastern_now().date()
 
     for i, row in enumerate(all_rows[1:], start=2):  # 1. satır başlık
         try:
             if len(row) < 10:
                 row = row + [""] * (10 - len(row))
+            tarih_str = row[0]
             symbol = row[1]
             entry_price = float(row[3]) if row[3] else None
             gun_values = row[4:9]  # Gün1..Gün5
             hedef = row[9]
 
-            if not symbol or entry_price is None or hedef:
+            if not symbol or entry_price is None or hedef or not tarih_str:
                 continue  # Zaten tamamlanmış, boşluk satırı ya da bozuk satır
 
-            empty_idx = None
-            for gi, gv in enumerate(gun_values):
-                if not gv:
-                    empty_idx = gi
-                    break
-            if empty_idx is None:
+            try:
+                entry_date = datetime.strptime(tarih_str, "%d.%m.%Y").date()
+            except Exception:
+                continue  # Bozuk tarih, güvenli şekilde atla
+
+            # Giriş tarihinden bugüne kaç takvim günü geçmiş - o kadarını
+            # kapsayacak yeterli tarihsel veri çekmek için pay bırakıyoruz
+            # (hafta sonu/tatil günleri de takvim gününe dahil olduğundan
+            # işlem günü sayısı her zaman daha az olur, fazladan pay güvenlidir).
+            days_since_entry = max((today_et_date - entry_date).days, 0)
+            needed_size = min(max(25, days_since_entry + 15), 300)
+
+            if symbol not in ohlcv_cache:
+                ohlcv_cache[symbol] = td_get_ohlcv(symbol, outputsize=needed_size)
+            df = ohlcv_cache[symbol]
+            if df is None or len(df) == 0:
+                print(f"[DEBUG update_daily_performance] {symbol}: veri alınamadı, bu satır bu turda atlandı.")
                 continue
 
-            if symbol not in price_cache:
-                df = td_get_ohlcv(symbol, outputsize=25)  # td_get_ohlcv >=20 satır şartı için 3 yerine 25
-                price_cache[symbol] = float(df["High"].iloc[-1]) if df is not None and len(df) > 0 else None
-            today_high = price_cache[symbol]
-            if today_high is None:
-                print(f"[DEBUG update_daily_performance] {symbol}: güncel fiyat alınamadı, bu satır bu turda atlandı.")
+            df_dates = df["Date"].dt.date
+            entry_matches = df.index[df_dates == entry_date].tolist()
+            if not entry_matches:
+                # Giriş tarihi çekilen veri aralığında yok (ör. kaynak henüz
+                # o günü içermiyor) - bu turda atla, sonraki turda tekrar denenir
                 continue
+            entry_idx = entry_matches[0]
 
-            col_index = 5 + empty_idx  # Gün1 = E = 5. kolon (1-based)
-            updates.append((i, col_index, round(today_high, 2)))
+            # Giriş tarihinden SONRAKİ gerçek işlem günleri = Gün1, Gün2, ...
+            following = df.iloc[entry_idx + 1: entry_idx + 6].reset_index(drop=True)
 
             target_price = entry_price * 1.05
             already_hit = any(float(g) >= target_price for g in gun_values if g)
-            if today_high >= target_price and not already_hit:
-                updates.append((i, 10, "✅"))
-                green_cells.append(gspread.utils.rowcol_to_a1(i, col_index))
-            elif empty_idx == 4:
-                updates.append((i, 10, "⛔"))
+
+            for gi in range(5):
+                if gun_values[gi]:
+                    continue  # bu gün zaten dolu, dokunma
+                if gi >= len(following):
+                    break  # bu Gün'ün takvim tarihi henüz gelmedi/veri yok
+                day_high = float(following.iloc[gi]["High"])
+                col_index = 5 + gi  # Gün1 = E = 5. kolon (1-based)
+                updates.append((i, col_index, round(day_high, 2)))
+
+                if day_high >= target_price and not already_hit:
+                    updates.append((i, 10, "✅"))
+                    green_cells.append(gspread.utils.rowcol_to_a1(i, col_index))
+                    already_hit = True
+                    break  # hedef tuttu, sonraki günleri doldurmaya gerek yok
+                elif gi == 4:
+                    updates.append((i, 10, "⛔"))
         except Exception as e:
             print(f"[DEBUG update_daily_performance] Satır {i} işlenirken hata: {e}")
             continue
