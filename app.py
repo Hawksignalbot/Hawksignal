@@ -922,7 +922,7 @@ def _get_last_used_date(ws):
     _last_date_cache["date"] = newest_str
     return newest_str
 
-def append_performance_row(symbol, entry_price, signal_type, meta=None):
+def append_performance_row(symbol, entry_price, signal_type, meta=None, tarih_override=None):
     """
     Yeni bir sinyal üretildiğinde tabloya yeni bağımsız satır ekler.
     Tarih her satırda tekrar yazılır (kendi kutusunda ortalı, haftanın
@@ -942,6 +942,10 @@ def append_performance_row(symbol, entry_price, signal_type, meta=None):
         if ws is None or entry_price is None:
             return False
         et = get_us_eastern_now()
+        if tarih_override is not None:
+            # Hafta sonu/tatilde çalıştırılan manuel işlemler için son
+            # geçerli işlem gününü kullanmak üzere
+            et = datetime(tarih_override.year, tarih_override.month, tarih_override.day)
         today_str = et.strftime("%d.%m.%Y")
         last_date = _get_last_used_date(ws)
 
@@ -1325,6 +1329,87 @@ def cleanup_duplicate_rows(dry_run=True):
               f"{rapor['kalan']} satır kaldı.")
     except Exception as e:
         print(f"[DEBUG cleanup_duplicate_rows] Yazma hatası: {e}")
+        rapor["hata"] = f"Yazma hatası: {e}"
+    return rapor
+
+
+def kiyas_gecersiz_satirlari_sil():
+    """
+    İşlem günü OLMAYAN bir tarihe (hafta sonu/tatil) kaydedilmiş
+    "Rastgele (Kıyas)" satırlarını siler.
+
+    Bu satırların giriş tarihi OHLCV verisinde hiç bulunmadığı için asla
+    ölçülemez; tabloda kalıcı olarak boş durur ve "giriş tarihi veride
+    bulunamayan" sayacını şişirirler.
+
+    Yalnızca kıyas satırlarına dokunur — gerçek sinyal satırları asla
+    silinmez (onlar bot tarafından seans içinde üretildiği için tarihleri
+    zaten geçerlidir).
+    """
+    rapor = {"silinen": 0, "kalan": 0, "hata": None}
+    ws = _get_performance_worksheet()
+    if ws is None:
+        rapor["hata"] = "Google Sheets bağlantısı kurulamadı"
+        return rapor
+    try:
+        all_rows = ws.get_all_values()
+    except Exception as e:
+        rapor["hata"] = f"Sheet okunamadı: {e}"
+        return rapor
+    if len(all_rows) <= 1:
+        return rapor
+
+    W = len(PERFORMANCE_SHEET_HEADER)
+    korunan = []
+    for row in all_rows[1:]:
+        padded = (row + [""] * W)[:W]
+        if not any((c or "").strip() for c in padded):
+            continue
+        tarih_str = (padded[0] or "").strip()
+        tip = (padded[2] or "").strip()
+        sil = False
+        if tip == "Rastgele (Kıyas)" and tarih_str:
+            try:
+                d = datetime.strptime(tarih_str, "%d.%m.%Y")
+                if d.weekday() >= 5 or is_market_holiday(d):
+                    sil = True
+            except Exception:
+                sil = True   # tarihi çözülemeyen kıyas satırı da işe yaramaz
+        if sil:
+            rapor["silinen"] += 1
+        else:
+            korunan.append(padded)
+
+    rapor["kalan"] = len(korunan)
+    if rapor["silinen"] == 0:
+        return rapor
+
+    def _pt(x):
+        try:
+            return datetime.strptime((x or "").strip(), "%d.%m.%Y")
+        except Exception:
+            return datetime.min
+    korunan.sort(key=lambda r: (r[1] or ""))
+    korunan.sort(key=lambda r: _pt(r[0]), reverse=True)
+
+    final_rows, son = [], None
+    for row in korunan:
+        if son is not None and row[0] != son:
+            final_rows.append([""] * W)
+        final_rows.append(row)
+        son = row[0]
+
+    sk = gspread.utils.rowcol_to_a1(1, W)[0]
+    try:
+        _sheets_call_with_retry(lambda: ws.batch_clear([f"A2:{sk}{len(all_rows) + 5}"]))
+        _sheets_call_with_retry(
+            lambda: ws.update(f"A2:{sk}{len(final_rows) + 1}", final_rows,
+                              value_input_option="USER_ENTERED")
+        )
+        _last_date_cache["date"] = None
+        print(f"[DEBUG kiyas_gecersiz_satirlari_sil] {rapor['silinen']} geçersiz kıyas satırı silindi")
+    except Exception as e:
+        print(f"[DEBUG kiyas_gecersiz_satirlari_sil] Yazma hatası: {e}")
         rapor["hata"] = f"Yazma hatası: {e}"
     return rapor
 
@@ -3202,12 +3287,59 @@ def handle_command(text, chat_id, thread_id=None):
             if pc.isdigit():
                 adet = max(1, min(30, int(pc)))
                 break
-        send_telegram(f"🎲 Rastgele kıyas örneği alınıyor ({adet} hisse)...", chat_id)
+        # BOZUK KIYAS SATIRLARINI SİL: /kiyas sil
+        if "sil" in t.split():
+            _silindi = kiyas_gecersiz_satirlari_sil()
+            if _silindi.get("hata"):
+                send_telegram(f"❌ Silme yapılamadı: {_silindi['hata']}", chat_id)
+            elif _silindi["silinen"] == 0:
+                send_telegram("✨ Silinecek geçersiz kıyas satırı bulunamadı.", chat_id)
+            else:
+                send_telegram(f"""🗑️ <b>GEÇERSİZ KIYAS SATIRLARI SİLİNDİ</b>
+──────────────────────────
+Silinen: {_silindi['silinen']} satır
+Kalan toplam: {_silindi['kalan']} satır
+
+Bunlar işlem günü olmayan bir tarihe (hafta sonu/tatil) kaydedilmiş, bu yüzden hiç ölçülemeyecek olan kıyas satırlarıydı.""", chat_id)
+            return
+
+        # Tarih: hafta sonu/tatilde son geçerli işlem gününe sarılır
+        _tarih, _sarildi = son_islem_gunu()
+        _tarih_str = _tarih.strftime("%d.%m.%Y")
+
+        send_telegram(
+            f"🎲 Rastgele kıyas örneği alınıyor ({adet} hisse)..."
+            + (f"\n📅 Borsa bugün kapalı — kayıtlar son işlem günü olan "
+               f"<b>{_tarih_str}</b> tarihiyle açılacak." if _sarildi else ""),
+            chat_id)
+
         havuz = get_raw_trading_pool()
         if not havuz:
             send_telegram("❌ Havuz alınamadı, kıyas örneği oluşturulamadı.", chat_id)
             return
-        secilenler = random.sample(havuz, min(adet, len(havuz)))
+
+        # BAĞIMSIZLIK: o tarihte zaten GERÇEK sinyal üretmiş semboller
+        # havuzdan çıkarılır. Aksi halde aynı hisse aynı fiyatla iki grupta
+        # da yer alır, sonuçlar birebir aynı çıkar ve kıyas "fark yok"
+        # yönüne çekilerek sistemi haksız yere iyi gösterir.
+        _haric = set()
+        try:
+            _ws_k = _get_performance_worksheet()
+            if _ws_k is not None:
+                for _r in _ws_k.get_all_values()[1:]:
+                    if len(_r) >= 3 and (_r[0] or "").strip() == _tarih_str \
+                            and (_r[2] or "").strip() != "Rastgele (Kıyas)":
+                        _haric.add((_r[1] or "").strip())
+        except Exception as e:
+            print(f"[DEBUG /kiyas] hariç listesi okunamadı: {e}")
+
+        uygun_havuz = [h for h in havuz if h not in _haric]
+        if not uygun_havuz:
+            send_telegram(
+                f"❌ {_tarih_str} tarihinde havuzdaki tüm semboller zaten sinyal üretmiş. "
+                "Bağımsız bir kıyas örneği oluşturulamıyor.", chat_id)
+            return
+        secilenler = random.sample(uygun_havuz, min(adet, len(uygun_havuz)))
         eklenen, atlanan = [], []
         for tk in secilenler:
             try:
@@ -3223,7 +3355,8 @@ def handle_command(text, chat_id, thread_id=None):
                     "atr_pct": "",
                     "kaynak": last_ohlcv_source.get("source", ""),
                 }
-                if append_performance_row(tk, fiyat, "Rastgele (Kıyas)", meta_k):
+                if append_performance_row(tk, fiyat, "Rastgele (Kıyas)", meta_k,
+                                          tarih_override=_tarih):
                     eklenen.append(f"{tk} ${fiyat:.2f}")
                 else:
                     atlanan.append(tk)
@@ -3232,6 +3365,8 @@ def handle_command(text, chat_id, thread_id=None):
                 atlanan.append(tk)
         send_telegram(f"""🎲 <b>RASTGELE KIYAS ÖRNEĞİ</b>
 ──────────────────────────
+📅 Kayıt tarihi: {_tarih_str}
+🚫 Sinyal ürettiği için hariç tutulan: {len(_haric)} sembol
 ✅ Tabloya eklenen: {len(eklenen)}
 {chr(10).join('• ' + e for e in eklenen) if eklenen else '—'}
 {('⏭️ Atlanan: ' + ', '.join(atlanan)) if atlanan else ''}
@@ -3545,6 +3680,8 @@ Her sinyal, kendi giriş fiyatıyla tabloya ayrı bir satır olarak yazılır ve
 
 /kiyas [adet] — Rastgele kıyas örneği al
    (eş değer: /benchmark, /rastgele — varsayılan 10, en fazla 30)
+   Hafta sonu/tatilde çalıştırılırsa kayıtları son işlem günü tarihiyle açar. O tarihte zaten sinyal üretmiş semboller hariç tutulur (iki grubun bağımsız kalması için).
+/kiyas sil — İşlem günü olmayan tarihe kaydedilmiş, ölçülemez kıyas satırlarını siler
    Havuzdan rastgele hisseleri sinyal üretmeden tabloya işler. Sinyallerin rastgele seçimden daha iyi olup olmadığını ölçmenin tek yolu budur.
 
 /temizle — Tekrarlanan satırları sil
@@ -4234,6 +4371,30 @@ def get_us_eastern_now():
     offset_hours = -4 if is_dst else -5
     et_tz = timezone(timedelta(hours=offset_hours))
     return utc_now.astimezone(et_tz)
+
+def son_islem_gunu(et_dt=None):
+    """
+    Verilen (veya şu anki) ET zamanına göre GEÇERLİ son işlem gününü döndürür.
+
+    Hafta sonu veya resmi tatilde geriye doğru sarar. Manuel komutlar
+    (ör. /kiyas) hafta sonu çalıştırıldığında bugünün tarihiyle satır
+    açarsa, o tarih OHLCV verisinde bulunmadığı için satır sonsuza kadar
+    ölçülemez halde kalır — bu yardımcı o hatayı önler.
+
+    Dönüş: (date nesnesi, geriye_sarildi_mi)
+    """
+    d = (et_dt or get_us_eastern_now())
+    if hasattr(d, "date"):
+        d = d.date()
+    sarildi = False
+    for _ in range(10):   # üst üste en fazla 10 gün kapalı olabilir
+        gecici = datetime(d.year, d.month, d.day)
+        if gecici.weekday() < 5 and not is_market_holiday(gecici):
+            return d, sarildi
+        d = d - timedelta(days=1)
+        sarildi = True
+    return d, sarildi
+
 
 def is_market_holiday(et_dt):
     return (et_dt.month, et_dt.day) in NASDAQ_HOLIDAYS_2026
