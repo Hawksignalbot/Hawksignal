@@ -64,6 +64,9 @@ THREAD_ID_FORMASYON = os.environ.get("THREAD_ID_FORMASYON")
 THREAD_ID_ELLIOTT = os.environ.get("THREAD_ID_ELLIOTT")
 THREAD_ID_HABER = os.environ.get("THREAD_ID_HABER")
 THREAD_ID_SISTEM = os.environ.get("THREAD_ID_SISTEM")
+# "Kıyas" konusu — otomatik günlük rastgele kıyas örneği bildirimleri buraya
+# gider. Railway'de THREAD_ID_KIYAS tanımlanmazsa aşağıdaki varsayılan kullanılır.
+THREAD_ID_KIYAS = os.environ.get("THREAD_ID_KIYAS", "6204")
 
 _KANAL_THREAD_MAP = {
     "trend": THREAD_ID_TREND,
@@ -72,11 +75,12 @@ _KANAL_THREAD_MAP = {
     "elliott": THREAD_ID_ELLIOTT,
     "haber": THREAD_ID_HABER,
     "sistem": THREAD_ID_SISTEM,
+    "kiyas": THREAD_ID_KIYAS,
 }
 
 def send_kanal(message, kanal_key):
     """
-    kanal_key: 'trend' | 'erkenuyari' | 'formasyon' | 'elliott' | 'haber' | 'sistem'
+    kanal_key: 'trend' | 'erkenuyari' | 'formasyon' | 'elliott' | 'haber' | 'sistem' | 'kiyas'
     Aynı gruba, ilgili konunun (topic) thread_id'siyle mesaj gönderir.
     """
     send_telegram(message, HAWK_GROUP_CHAT_ID, _KANAL_THREAD_MAP.get(kanal_key))
@@ -3445,11 +3449,18 @@ def maybe_run_daily_benchmark():
         if r.get("hata"):
             print(f"[DEBUG maybe_run_daily_benchmark] atlandı: {r['hata']}")
             return
-        send_telegram(
-            f"🎲 <b>Günlük kıyas örneği alındı</b> — {r['tarih'].strftime('%d.%m.%Y')}\n"
-            f"Eklenen: {len(r['eklenen'])} hisse · Hariç tutulan: {r['haric']} sembol\n"
-            f"<i>Rastgele kıyas grubu, sinyallerin gerçekten değer üretip "
-            f"üretmediğini ölçmek için otomatik olarak toplanıyor.</i>"
+        listeleme = "\n".join("• " + e for e in r["eklenen"]) if r["eklenen"] else "—"
+        send_kanal(
+            f"🎲 <b>GÜNLÜK KIYAS ÖRNEĞİ</b> — {r['tarih'].strftime('%d.%m.%Y')}\n"
+            f"──────────────────────────\n"
+            f"✅ Eklenen: {len(r['eklenen'])} hisse\n"
+            f"{listeleme}\n"
+            f"🚫 Sinyal ürettiği için hariç tutulan: {r['haric']} sembol\n"
+            f"──────────────────────────\n"
+            f"<i>Bu grup, sinyallerin rastgele seçimden gerçekten daha iyi olup "
+            f"olmadığını ölçmek için otomatik toplanıyor. Sonuçlar /istatistik "
+            f"raporundaki \"Sinyal Tipine Göre\" bölümünde karşılaştırmalı görünür.</i>",
+            "kiyas"
         )
         print(f"[DEBUG maybe_run_daily_benchmark] {len(r['eklenen'])} kıyas satırı eklendi")
     except Exception as e:
@@ -3839,11 +3850,12 @@ https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit
 📈 TARAMA | ⚡ ERKEN UYARI
 🌊 ELLİOTT DALGA | 📐 FORMASYON
 📌 TAKİP | 📊 ANALİZ | 📰 HABER
+🎲 KIYAS
 🔔 ALARMLAR | 💼 PORTFÖY
 ──────────────────────────
 🤖 Bot Durumu: {"✅ Açık" if bot_manual_state["active"] else "⛔ Manuel Kapalı"}
 💧 Likidite Filtresi: {f"✅ Açık (min ${MIN_PRICE:.2f} / ${MIN_DOLLAR_VOL_M:.1f}M)" if LIKIDITE_FILTRESI_AKTIF else "⛔ Kapalı"}
-🎲 Otomatik Kıyas: {"⛔ Kapalı" if os.environ.get("KIYAS_OTOMATIK", "1") == "0" else f"✅ Açık (günlük {os.environ.get('KIYAS_ADET', '15')} hisse, kapanış sonrası)"}
+🎲 Otomatik Kıyas: {"⛔ Kapalı" if os.environ.get("KIYAS_OTOMATIK", "1") == "0" else f"✅ Açık (günlük {os.environ.get('KIYAS_ADET', '15')} hisse, kapanış sonrası → Kıyas konusu)"}
 ──────────────────────────
 Detay için /yardim veya /help""", chat_id)
         return
@@ -3874,7 +3886,8 @@ Her sinyal, kendi giriş fiyatıyla tabloya ayrı bir satır olarak yazılır ve
 /kiyas [adet] — Rastgele kıyas örneği al (ELLE)
    (eş değer: /benchmark, /rastgele — varsayılan 10, en fazla 30)
    ℹ️ Bu örnek her işlem günü kapanıştan sonra OTOMATİK olarak alınır; elle çalıştırmak zorunlu değildir. Otomatik toplama giriş fiyatı olarak günün gerçek kapanışını kullandığı için daha tutarlıdır.
-   Kapatmak/ayarlamak için Railway ortam değişkenleri: KIYAS_OTOMATIK=0, KIYAS_ADET=15
+   Otomatik bildirimler <b>Kıyas</b> konusuna gönderilir. Elle çalıştırdığında ise yazdığın konuya cevap verir.
+   Ayarlar (Railway): KIYAS_OTOMATIK=0 (kapat), KIYAS_ADET=15 (adet), THREAD_ID_KIYAS (konu no)
    Hafta sonu/tatilde çalıştırılırsa kayıtları son işlem günü tarihiyle açar. O tarihte zaten sinyal üretmiş semboller hariç tutulur (iki grubun bağımsız kalması için).
 /kiyas sil — İşlem günü olmayan tarihe kaydedilmiş, ölçülemez kıyas satırlarını siler
    Havuzdan rastgele hisseleri sinyal üretmeden tabloya işler. Sinyallerin rastgele seçimden daha iyi olup olmadığını ölçmenin tek yolu budur.
