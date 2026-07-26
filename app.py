@@ -593,7 +593,8 @@ def td_get_ohlcv(symbol, outputsize=210):
 # devam edebilir.
 PERFORMANCE_SHEET_HEADER = [
     "Tarih", "Sembol", "Sinyal Tipi", "Giriş Fiyatı",
-    "Gün1 Max", "Gün2 Max", "Gün3 Max", "Gün4 Max", "Gün5 Max", "Hedef (%5)"
+    "Gün1 Max", "Gün2 Max", "Gün3 Max", "Gün4 Max", "Gün5 Max",
+    "Sonuç", "En Düşük", "Max Düşüş %", "Tuttuğu Gün", "Zarar Kes"
 ]
 _gsheet_client_cache = {"client": None, "worksheet": None}
 _last_date_cache = {"date": None}  # {"date": "08.07.2026"} - son yazılan tarih
@@ -610,6 +611,10 @@ _FMT_GUN_HEDEF_TUTTU = {
 # Hedef (%5) tutulduktan SONRAKİ gün hücreleri: dümdüz yeşil arka plan.
 # Takip o gün kapandığı için değer yazılmaz, sadece görsel olarak
 # "bu satır hedefi tuttu" bakışta anlaşılsın diye boyanır.
+_FMT_ZARAR_KES = {
+    "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+    "textFormat": {"bold": True, "foregroundColor": {"red": 0.75, "green": 0.11, "blue": 0.11}}
+}
 _FMT_GUN_HEDEF_SONRASI = {
     "horizontalAlignment": "RIGHT", "verticalAlignment": "MIDDLE",
     "backgroundColor": {"red": 0.06, "green": 0.42, "blue": 0.13}
@@ -729,7 +734,7 @@ def _get_performance_worksheet():
         first_row = worksheet.row_values(1)
         if first_row != PERFORMANCE_SHEET_HEADER:
             worksheet.update("A1", [PERFORMANCE_SHEET_HEADER])
-            worksheet.format("A1:J1", {
+            worksheet.format(f"A1:{gspread.utils.rowcol_to_a1(1, len(PERFORMANCE_SHEET_HEADER))[0]}1", {
                 "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
                 "textFormat": {"bold": True}
             })
@@ -800,7 +805,8 @@ def append_performance_row(symbol, entry_price, signal_type):
         last_date = _get_last_used_date(ws)
 
         if last_date is not None and last_date != today_str:
-            ws.append_row([""] * 10, value_input_option="USER_ENTERED")  # gün arası boşluk
+            ws.append_row([""] * len(PERFORMANCE_SHEET_HEADER),
+                          value_input_option="USER_ENTERED")  # gün arası boşluk
 
         all_vals = ws.get_all_values()
 
@@ -811,15 +817,20 @@ def append_performance_row(symbol, entry_price, signal_type):
 
         new_row_index = len(all_vals) + 1
 
-        row = [today_str, symbol, signal_type, round(float(entry_price), 2), "", "", "", "", "", ""]
+        row = ([today_str, symbol, signal_type, round(float(entry_price), 2)]
+               + [""] * (len(PERFORMANCE_SHEET_HEADER) - 4))
         ws.append_row(row, value_input_option="USER_ENTERED")
 
-        ws.format(f"A{new_row_index}", _get_tarih_format(et))
-        ws.format(f"B{new_row_index}", _FMT_SEMBOL)
-        ws.format(f"C{new_row_index}", _FMT_CENTER)
-        ws.format(f"D{new_row_index}", _FMT_FIYAT_BOLD)
-        ws.format(f"E{new_row_index}:I{new_row_index}", _FMT_GUN)
-        ws.format(f"J{new_row_index}", _FMT_CENTER)
+        # Tek toplu biçimlendirme isteği (satır başına 6 ayrı çağrı yerine)
+        son_kolon = gspread.utils.rowcol_to_a1(1, len(PERFORMANCE_SHEET_HEADER))[0]
+        _sheets_call_with_retry(lambda: ws.batch_format([
+            {"range": f"A{new_row_index}", "format": _get_tarih_format(et)},
+            {"range": f"B{new_row_index}", "format": _FMT_SEMBOL},
+            {"range": f"C{new_row_index}", "format": _FMT_CENTER},
+            {"range": f"D{new_row_index}", "format": _FMT_FIYAT_BOLD},
+            {"range": f"E{new_row_index}:I{new_row_index}", "format": _FMT_GUN},
+            {"range": f"J{new_row_index}:{son_kolon}{new_row_index}", "format": _FMT_CENTER},
+        ]))
 
         _last_date_cache["date"] = today_str
         print(f"[DEBUG append_performance_row] {symbol} eklendi ({signal_type}, giriş ${entry_price:.2f})")
@@ -830,33 +841,41 @@ def append_performance_row(symbol, entry_price, signal_type):
 
 def update_daily_performance():
     """
-    Her işlem günü kapanışından sonra bir kez çağrılır (ayrıca /performans
-    komutuyla elle tetiklenebilir). Her satır için, GERÇEK giriş tarihinden
-    (Tarih sütunu) itibaren gelen işlem günlerine göre Gün1-5 sütunlarını
-    DOĞRU tarihsel Yüksek (High) fiyatlarıyla doldurur.
+    Her satırın GERÇEK giriş tarihinden itibaren gelen 5 işlem gününü
+    tarihsel OHLCV verisiyle ölçer ve tabloyu doldurur.
 
-    ÖNEMLİ: "bugünün fiyatı" bir sonraki boş sütuna körlemesine yazılmıyor —
-    hangi Gün sütunu hangi takvim gününe denk geliyorsa, o günün gerçek
-    tarihsel OHLCV verisi kullanılıyor (giriş tarihi + N. işlem günü). Bu
-    sayede bot bir süre hiç çalışmasa bile (ör. Railway hesabının
-    dondurulması) tekrar başladığında atlanan günler otomatik ve doğru
-    şekilde geriye dönük tamamlanır (backfill).
+    ÖLÇÜLEN DEĞERLER
+    - Gün1-5 Max: o günün en yüksek (High) fiyatı.
+    - En Düşük: 5 gün boyunca görülen en düşük (Low) fiyat.
+    - Max Düşüş %: girişe göre en kötü dip (negatif yüzde). Sadece High
+      izlemek başarıyı olduğundan iyi gösteriyordu — bu sütun gerçekte
+      ne kadar batıldığını ortaya koyar.
+    - Tuttuğu Gün: %5 hedefe ulaşılan gün (1-5).
+    - Zarar Kes: hedefe ulaşmadan ÖNCE kırılan en derin zarar kes eşiği
+      (-%3 / -%5 / -%10). Üç eşik birden ölçülür; hangisinin daha iyi
+      sonuç verdiğine veriye bakarak karar verilir, tahminle değil.
 
-    ONARIM: Hedef sütunu (✅/⛔) dolu olmasına rağmen Gün sütunları boş
-    kalmış eski/bozuk satırlar da tamir edilir — eskiden bu satırlar
-    "tamamlanmış" sayılıp sonsuza kadar boş kalıyordu.
+    SONUÇ SÜTUNU
+      ✅ Hedef (%5) tuttu
+      🛑 Zarar kes (-%5 referans) hedeften önce tetiklendi
+      ⛔ 5 gün doldu, ne hedef ne zarar kes
+      ⚠️ Veri anormal (bölünme/ters bölünme şüphesi) — istatistiğe katılmaz
 
-    - Fiyat giriş fiyatının %5 üstüne ulaştığı gün ✅ yazılır, o günün
-      hücresi koyu yeşil yazı ile vurgulanır.
-    - Hedef tutulduktan SONRAKİ gün hücreleri dümdüz yeşil arka planla
-      boyanır (değer yazılmaz) — hedefi tutan satırlar bakışta belli olur.
-    - 5. gün de dolduğu halde hedefe hiç ulaşılmadıysa ⛔ yazılır.
+    ÖNEMLİ VARSAYIM: Günlük veride High ile Low'un gün içinde hangisinin
+    önce geldiği bilinmez. Bu yüzden aynı gün her ikisi de gerçekleşmişse
+    KÖTÜ SENARYO kabul edilir (zarar kes önce tetiklenmiş sayılır). Bu,
+    başarı oranını olduğundan iyi göstermemek için bilinçli bir seçimdir.
 
-    Dönüş: tanı amaçlı özet sözlük (elle tetiklemede kullanıcıya gösterilir).
+    Dönüş: tanı amaçlı özet sözlük.
     """
+    STOP_ESIKLERI = [3.0, 5.0, 10.0]   # yüzde
+    STOP_REFERANS = 5.0                # Sonuç sütununda kullanılan eşik
+    ANOMALI_ORANI = 0.50               # günden güne %50+ sıçrama = şüpheli
+
     stats = {"satir": 0, "islenen": 0, "hucre": 0, "veri_yok": 0,
              "tarih_yok": 0, "tamam": 0, "fiyat_okunamadi": 0,
-             "tarih_bozuk": 0, "gun_beklemede": 0, "dokunulmadi": 0, "hata": None}
+             "tarih_bozuk": 0, "gun_beklemede": 0, "dokunulmadi": 0,
+             "anomali": 0, "hata": None}
 
     ws = _get_performance_worksheet()
     if ws is None:
@@ -868,40 +887,40 @@ def update_daily_performance():
         print(f"[DEBUG update_daily_performance] Sheet okunamadı: {e}")
         stats["hata"] = f"Sheet okunamadı: {e}"
         return stats
-
     if len(all_rows) <= 1:
         stats["hata"] = "Tabloda başlık dışında satır yok"
         return stats
 
+    W = len(PERFORMANCE_SHEET_HEADER)
     updates = []        # (row, col, value)
-    hit_cells = []      # hedefi tutan gün hücreleri (koyu yeşil yazı)
-    after_cells = []    # hedef sonrası gün hücreleri (dümdüz yeşil zemin)
-    ohlcv_cache = {}    # symbol -> df (aynı sembolü bu turda tekrar çekmemek için)
+    hit_cells = []      # hedefin tutulduğu gün hücresi
+    after_cells = []    # hedef sonrası günler (dümdüz yeşil)
+    stop_cells = []     # zarar kes tetiklenen satırın Sonuç hücresi
+    ohlcv_cache = {}
     today_et_date = get_us_eastern_now().date()
 
-    for i, row in enumerate(all_rows[1:], start=2):  # 1. satır başlık
+    for i, row in enumerate(all_rows[1:], start=2):
         try:
-            if len(row) < 10:
-                row = row + [""] * (10 - len(row))
+            row = (row + [""] * W)[:W]
             tarih_str = (row[0] or "").strip()
             symbol = (row[1] or "").strip()
             entry_price = _parse_sheet_number(row[3])
-            gun_values = [(g or "").strip() for g in row[4:9]]  # Gün1..Gün5
-            hedef = (row[9] or "").strip()
+            gun_values = [(g or "").strip() for g in row[4:9]]
+            sonuc = (row[9] or "").strip()
+            en_dusuk_mevcut = (row[10] or "").strip()
 
             if not symbol or not tarih_str:
-                continue  # boşluk satırı ya da bozuk satır
+                continue
             if entry_price is None or entry_price <= 0:
                 stats["fiyat_okunamadi"] += 1
-                print(f"[DEBUG update_daily_performance] Satır {i} ({symbol}): giriş fiyatı okunamadı -> {row[3]!r}")
                 continue
 
             stats["satir"] += 1
 
-            # Hedef dolu VE en az bir gün değeri yazılmışsa bu satır gerçekten
-            # tamamlanmış demektir — API kotasını korumak için dokunmuyoruz.
-            # Hedef dolu ama TÜM günler boşsa (eski bozuk satırlar) onarılır.
-            if hedef and any(gun_values):
+            # Yeni biçimde tamamlanmış satır: Sonuç VE En Düşük dolu.
+            # (Eski satırlarda En Düşük boş olduğu için onlar yeniden
+            # işlenip yeni sütunlar geriye dönük doldurulur.)
+            if sonuc and en_dusuk_mevcut:
                 stats["tamam"] += 1
                 continue
 
@@ -909,121 +928,133 @@ def update_daily_performance():
                 entry_date = datetime.strptime(tarih_str, "%d.%m.%Y").date()
             except Exception:
                 stats["tarih_bozuk"] += 1
-                print(f"[DEBUG update_daily_performance] Satır {i} ({symbol}): tarih okunamadı -> {tarih_str!r}")
                 continue
 
-            # Giriş tarihinden bugüne kaç takvim günü geçmiş — o aralığı
-            # kapsayacak kadar tarihsel veri çekiyoruz. Hafta sonu/tatiller de
-            # takvim gününe dahil olduğu için işlem günü sayısı daima daha az
-            # olur; fazladan pay bırakmak güvenlidir.
-            days_since_entry = max((today_et_date - entry_date).days, 0)
-            needed_size = min(max(25, days_since_entry + 15), 300)
-
+            days_since = max((today_et_date - entry_date).days, 0)
+            needed = min(max(25, days_since + 15), 300)
             if symbol not in ohlcv_cache:
-                ohlcv_cache[symbol] = td_get_ohlcv(symbol, outputsize=needed_size)
+                ohlcv_cache[symbol] = td_get_ohlcv(symbol, outputsize=needed)
             df = ohlcv_cache[symbol]
             if df is None or len(df) == 0:
-                print(f"[DEBUG update_daily_performance] {symbol}: veri alınamadı, satır {i} atlandı.")
                 stats["veri_yok"] += 1
                 continue
 
-            df_dates = df["Date"].dt.date
-            entry_matches = df.index[df_dates == entry_date].tolist()
-            if not entry_matches:
-                # Giriş tarihi çekilen veri aralığında yok (kaynak o günü
-                # içermiyor) — bu turda atla, sonraki turda tekrar denenir.
-                print(f"[DEBUG update_daily_performance] {symbol}: giriş tarihi {tarih_str} veride bulunamadı, satır {i} atlandı.")
+            matches = df.index[df["Date"].dt.date == entry_date].tolist()
+            if not matches:
                 stats["tarih_yok"] += 1
                 continue
-            entry_idx = entry_matches[0]
+            following = df.iloc[matches[0] + 1: matches[0] + 6].reset_index(drop=True)
+            n_gun = len(following)
+            if n_gun == 0:
+                stats["gun_beklemede"] += 1
+                continue
 
-            # Giriş tarihinden SONRAKİ gerçek işlem günleri = Gün1, Gün2, ...
-            following = df.iloc[entry_idx + 1: entry_idx + 6].reset_index(drop=True)
+            highs = [float(following.iloc[k]["High"]) for k in range(n_gun)]
+            lows = [float(following.iloc[k]["Low"]) for k in range(n_gun)]
 
-            target_price = entry_price * 1.05
-            hit_idx = None
-            for gi, gv in enumerate(gun_values):
-                if gv:
-                    gv_num = _parse_sheet_number(gv)
-                    if gv_num is not None and gv_num >= target_price:
-                        hit_idx = gi
-                        break
+            target = entry_price * 1.05
+            stop_fiyat = {th: entry_price * (1 - th / 100.0) for th in STOP_ESIKLERI}
 
-            row_touched = False
-            bekleyen_gun = False   # veri henüz gelmediği için doldurulamayan gün var mı
-            bos_gun_kaldi = False  # doldurulamamış (boş) gün kaldı mı
-            if hit_idx is None:
-                for gi in range(5):
-                    if gun_values[gi]:
-                        continue  # bu gün zaten dolu, dokunma
-                    if gi >= len(following):
-                        # Bu Gün'ün takvim tarihi henüz gelmedi ya da kaynakta veri yok
-                        bekleyen_gun = True
-                        bos_gun_kaldi = True
-                        break
-                    day_high = float(following.iloc[gi]["High"])
-                    col_index = 5 + gi  # Gün1 = E = 5. kolon (1-based)
-                    updates.append((i, col_index, round(day_high, 2)))
-                    row_touched = True
+            # Günleri sırayla yürü: aynı gün içinde KÖTÜ SENARYO (zarar kes önce)
+            hit_gun = None
+            stop_gun = {th: None for th in STOP_ESIKLERI}
+            for k in range(n_gun):
+                for th in STOP_ESIKLERI:
+                    if stop_gun[th] is None and lows[k] <= stop_fiyat[th]:
+                        stop_gun[th] = k
+                if hit_gun is None and highs[k] >= target:
+                    hit_gun = k
 
-                    if day_high >= target_price:
-                        if hedef != "✅":
-                            updates.append((i, 10, "✅"))
-                        hit_cells.append(gspread.utils.rowcol_to_a1(i, col_index))
-                        hit_idx = gi
-                        break  # hedef tuttu, takip bu satır için kapandı
-                    elif gi == 4 and hedef != "⛔":
-                        updates.append((i, 10, "⛔"))
+            # Anormallik: günden güne %50+ sıçrama (bölünme şüphesi)
+            seri = [entry_price] + highs
+            anormal = any(
+                seri[k] > 0 and abs(seri[k + 1] - seri[k]) / seri[k] > ANOMALI_ORANI
+                for k in range(len(seri) - 1)
+            )
 
-                # TAMAMLAMA BOŞLUĞU: 5 günün tamamı dolu, hedef hiç tutmamış,
-                # ama Hedef sütunu boş kalmış satırlar (önceki sürümlerin
-                # kalıntısı) burada ⛔ ile kapatılır — eskiden bu satırlar
-                # sonsuza kadar "işlenmedi" durumunda takılı kalıyordu.
-                if (hit_idx is None and not bos_gun_kaldi
-                        and all(gun_values) and not hedef):
-                    updates.append((i, 10, "⛔"))
-                    row_touched = True
+            en_dusuk = min(lows)
+            max_dusus_pct = (en_dusuk - entry_price) / entry_price * 100.0
 
-            # Hedef tutulduysa, sonraki gün hücrelerini dümdüz yeşil boya
-            if hit_idx is not None:
-                for gi in range(hit_idx + 1, 5):
-                    after_cells.append(gspread.utils.rowcol_to_a1(i, 5 + gi))
-                row_touched = True
+            # Hedeften ÖNCE (veya aynı gün) kırılan en derin eşik
+            kirilan = [th for th in STOP_ESIKLERI
+                       if stop_gun[th] is not None
+                       and (hit_gun is None or stop_gun[th] <= hit_gun)]
+            zarar_kes_metni = f"-%{int(max(kirilan))}" if kirilan else "—"
 
-            if row_touched:
+            ref_stoplandi = (stop_gun[STOP_REFERANS] is not None
+                             and (hit_gun is None or stop_gun[STOP_REFERANS] <= hit_gun))
+
+            if anormal:
+                yeni_sonuc = "⚠️"
+                stats["anomali"] += 1
+            elif ref_stoplandi:
+                yeni_sonuc = "🛑"
+            elif hit_gun is not None:
+                yeni_sonuc = "✅"
+            elif n_gun >= 5:
+                yeni_sonuc = "⛔"
+            else:
+                yeni_sonuc = ""   # takip penceresi hâlâ açık
+
+            dokundu = False
+
+            # Gün1-5 Max sütunlarını doldur (hedefin tutulduğu güne kadar)
+            son_gun = hit_gun if hit_gun is not None else n_gun - 1
+            for k in range(min(son_gun + 1, 5)):
+                if gun_values[k]:
+                    continue
+                updates.append((i, 5 + k, round(highs[k], 2)))
+                dokundu = True
+
+            if hit_gun is not None and hit_gun < 5:
+                hit_cells.append(gspread.utils.rowcol_to_a1(i, 5 + hit_gun))
+                for k in range(hit_gun + 1, 5):
+                    after_cells.append(gspread.utils.rowcol_to_a1(i, 5 + k))
+                dokundu = True
+
+            if yeni_sonuc and yeni_sonuc != sonuc:
+                updates.append((i, 10, yeni_sonuc))
+                dokundu = True
+            if yeni_sonuc == "🛑":
+                stop_cells.append(gspread.utils.rowcol_to_a1(i, 10))
+
+            if not en_dusuk_mevcut:
+                updates.append((i, 11, round(en_dusuk, 2)))
+                updates.append((i, 12, f"%{max_dusus_pct:.1f}"))
+                dokundu = True
+            updates.append((i, 13, (hit_gun + 1) if hit_gun is not None else "—"))
+            updates.append((i, 14, zarar_kes_metni))
+            dokundu = True
+
+            if dokundu:
                 stats["islenen"] += 1
-            elif bekleyen_gun:
+            elif n_gun < 5:
                 stats["gun_beklemede"] += 1
             else:
                 stats["dokunulmadi"] += 1
-                print(f"[DEBUG update_daily_performance] Satır {i} ({symbol}, {tarih_str}): "
-                      f"dokunulmadı. gunler={gun_values} hedef={hedef!r} veri_gun={len(following)}")
         except Exception as e:
-            print(f"[DEBUG update_daily_performance] Satır {i} işlenirken hata: {e}")
+            print(f"[DEBUG update_daily_performance] Satır {i} hata: {e}")
             continue
 
     stats["hucre"] = len(updates)
-
-    if not updates and not hit_cells and not after_cells:
+    if not updates and not hit_cells and not after_cells and not stop_cells:
         return stats
     try:
         if updates:
-            cell_updates = [{"range": gspread.utils.rowcol_to_a1(r, c), "values": [[v]]} for r, c, v in updates]
-            _sheets_call_with_retry(
-                lambda: ws.batch_update(cell_updates, value_input_option="USER_ENTERED")
-            )
-        # Biçimlendirmeyi TEK toplu istekte gönderiyoruz. Eskiden her hücre
-        # için ayrı ws.format() çağrılıyordu; bu yüzlerce API isteği demekti
-        # ve Google'ın "dakikada yazma isteği" kotasını (429) aşıyordu.
-        format_requests = []
+            cu = [{"range": gspread.utils.rowcol_to_a1(r, c), "values": [[v]]} for r, c, v in updates]
+            _sheets_call_with_retry(lambda: ws.batch_update(cu, value_input_option="USER_ENTERED"))
+        # Tüm biçimlendirme TEK toplu istekte (kota koruması)
+        fr = []
         for a1 in hit_cells:
-            format_requests.append({"range": a1, "format": _FMT_GUN_HEDEF_TUTTU})
+            fr.append({"range": a1, "format": _FMT_GUN_HEDEF_TUTTU})
         for a1 in after_cells:
-            format_requests.append({"range": a1, "format": _FMT_GUN_HEDEF_SONRASI})
-        if format_requests:
-            _sheets_call_with_retry(lambda: ws.batch_format(format_requests))
-        print(f"[DEBUG update_daily_performance] {len(updates)} hücre güncellendi "
-              f"({len(hit_cells)} hedef tuttu, {len(after_cells)} hücre yeşil boyandı)")
+            fr.append({"range": a1, "format": _FMT_GUN_HEDEF_SONRASI})
+        for a1 in stop_cells:
+            fr.append({"range": a1, "format": _FMT_ZARAR_KES})
+        if fr:
+            _sheets_call_with_retry(lambda: ws.batch_format(fr))
+        print(f"[DEBUG update_daily_performance] {len(updates)} hücre, "
+              f"{len(hit_cells)} hedef, {len(stop_cells)} zarar kes")
     except Exception as e:
         print(f"[DEBUG update_daily_performance] Toplu güncelleme hatası: {e}")
         stats["hata"] = f"Yazma hatası: {e}"
@@ -1152,8 +1183,8 @@ def resort_performance_sheet():
     data_rows = []
     for row in all_rows[1:]:
         if row and any(cell.strip() for cell in row if isinstance(cell, str)):
-            padded = row + [""] * (10 - len(row)) if len(row) < 10 else row[:10]
-            data_rows.append(padded)
+            W = len(PERFORMANCE_SHEET_HEADER)
+            data_rows.append((row + [""] * W)[:W])
 
     if not data_rows:
         return
@@ -1177,7 +1208,7 @@ def resort_performance_sheet():
     last_date = None
     for row in all_rows[1:]:
         if row and any(cell.strip() for cell in row if isinstance(cell, str)):
-            already_sorted_rows.append(row + [""] * (10 - len(row)) if len(row) < 10 else row[:10])
+            already_sorted_rows.append((row + [""] * len(PERFORMANCE_SHEET_HEADER))[:len(PERFORMANCE_SHEET_HEADER)])
     if already_sorted_rows == data_rows:
         return
 
@@ -1187,15 +1218,16 @@ def resort_performance_sheet():
     for row in data_rows:
         current_date = row[0]
         if last_date is not None and current_date != last_date:
-            final_rows.append([""] * 10)
+            final_rows.append([""] * len(PERFORMANCE_SHEET_HEADER))
         final_rows.append(row)
         last_date = current_date
 
     try:
         # Mevcut veri alanını temizle, sıralı hâliyle yeniden yaz
-        _sheets_call_with_retry(lambda: ws.batch_clear([f"A2:J{len(all_rows) + 5}"]))
+        _son_kolon = gspread.utils.rowcol_to_a1(1, len(PERFORMANCE_SHEET_HEADER))[0]
+        _sheets_call_with_retry(lambda: ws.batch_clear([f"A2:{_son_kolon}{len(all_rows) + 5}"]))
         _sheets_call_with_retry(
-            lambda: ws.update(f"A2:J{len(final_rows) + 1}", final_rows, value_input_option="USER_ENTERED")
+            lambda: ws.update(f"A2:{_son_kolon}{len(final_rows) + 1}", final_rows, value_input_option="USER_ENTERED")
         )
 
         # Tüm biçimlendirmeyi TEK bir toplu istekte gönderiyoruz (satır
@@ -1216,7 +1248,7 @@ def resort_performance_sheet():
             format_requests.append({"range": f"C{idx}", "format": _FMT_CENTER})
             format_requests.append({"range": f"D{idx}", "format": _FMT_FIYAT_BOLD})
             format_requests.append({"range": f"E{idx}:I{idx}", "format": _FMT_GUN})
-            format_requests.append({"range": f"J{idx}", "format": _FMT_CENTER})
+            format_requests.append({"range": f"J{idx}:{_son_kolon}{idx}", "format": _FMT_CENTER})
 
             if row[9] == "✅":
                 try:
@@ -2953,6 +2985,108 @@ def handle_command(text, chat_id, thread_id=None):
     # ve sorun olduğunda nedenini görebilmek için tanı bilgisi de döner.
     # TEKRARLANAN SATIRLARI TEMİZLE — geri alınamaz olduğu için iki aşamalı:
     # "/temizle" önizleme gösterir, "/temizle onayla" gerçekten siler.
+    # İSTATİSTİK — performans tablosunu analiz eder, sistemin nerede
+    # gerçekten işe yaradığını gösterir.
+    if any(t.startswith(x) for x in ['/istatistik','/istatistikler','/stats','/analiz-rapor']):
+        ws_ist = _get_performance_worksheet()
+        if ws_ist is None:
+            send_telegram("❌ Google Sheets bağlantısı kurulamadı.", chat_id)
+            return
+        try:
+            rows_ist = ws_ist.get_all_values()
+        except Exception as e:
+            send_telegram(f"❌ Tablo okunamadı: {e}", chat_id)
+            return
+
+        W = len(PERFORMANCE_SHEET_HEADER)
+        kayitlar = []
+        for r in rows_ist[1:]:
+            r = (r + [""] * W)[:W]
+            sembol = (r[1] or "").strip()
+            tip = (r[2] or "").strip()
+            giris = _parse_sheet_number(r[3])
+            sonuc = (r[9] or "").strip()
+            dusus = _parse_sheet_number((r[11] or "").replace("%", ""))
+            gun = (r[12] or "").strip()
+            zk = (r[13] or "").strip()
+            if not sembol or giris is None or sonuc not in ("✅", "🛑", "⛔"):
+                continue  # ⚠️ (anormal) ve henüz kapanmamış satırlar hariç
+            kayitlar.append({"tip": tip, "giris": giris, "sonuc": sonuc,
+                             "dusus": dusus, "gun": gun, "zk": zk})
+
+        if not kayitlar:
+            send_telegram("""📊 <b>İSTATİSTİK</b>
+
+Henüz analiz edilebilecek kapanmış satır yok.
+Önce /performans komutunu çalıştır.""", chat_id)
+            return
+
+        def oran(liste):
+            if not liste:
+                return "—"
+            t = sum(1 for k in liste if k["sonuc"] == "✅")
+            return f"{t}/{len(liste)} (%{t / len(liste) * 100:.0f})"
+
+        # Fiyat aralıklarına göre
+        bantlar = [("0-1 $", 0, 1), ("1-5 $", 1, 5), ("5-20 $", 5, 20),
+                   ("20-100 $", 20, 100), ("100+ $", 100, 10 ** 9)]
+        bant_satir = []
+        for ad, lo, hi in bantlar:
+            grup = [k for k in kayitlar if lo <= k["giris"] < hi]
+            if grup:
+                bant_satir.append(f"• {ad}: {oran(grup)}")
+
+        # Sinyal tipine göre
+        tipler = sorted({k["tip"] for k in kayitlar if k["tip"]})
+        tip_satir = [f"• {tp}: {oran([k for k in kayitlar if k['tip'] == tp])}" for tp in tipler]
+
+        # Hedefin tutulduğu gün dağılımı
+        kazananlar = [k for k in kayitlar if k["sonuc"] == "✅"]
+        gun_sayim = {}
+        for k in kazananlar:
+            if k["gun"] and k["gun"] != "—":
+                gun_sayim[k["gun"]] = gun_sayim.get(k["gun"], 0) + 1
+        gun_satir = [f"• Gün {g}: {gun_sayim[g]}" for g in sorted(gun_sayim)]
+
+        # Zarar kes eşiklerinin karşılaştırması: her eşik, hedefe ulaşmadan
+        # önce kaç işlemde tetiklenmiş olurdu?
+        zk_satir = []
+        for th in (3, 5, 10):
+            n = sum(1 for k in kayitlar if k["zk"] and k["zk"] != "—"
+                    and _parse_sheet_number(k["zk"].replace("-", "").replace("%", "")) is not None
+                    and abs(_parse_sheet_number(k["zk"].replace("-", "").replace("%", ""))) >= th)
+            zk_satir.append(f"• -%{th} eşiği: {n}/{len(kayitlar)} işlemde tetiklenirdi")
+
+        dususler = [k["dusus"] for k in kayitlar if k["dusus"] is not None]
+        ort_dusus = f"%{sum(dususler) / len(dususler):.1f}" if dususler else "—"
+        en_kotu = f"%{min(dususler):.1f}" if dususler else "—"
+
+        send_telegram(f"""📊 <b>SİSTEM İSTATİSTİĞİ</b>
+Kapanmış işlem: {len(kayitlar)}
+(⚠️ anormal veri ve açık satırlar hariç)
+──────────────────────────
+🎯 <b>GENEL BAŞARI</b>
+✅ Hedef tuttu: {oran(kayitlar)}
+🛑 Zarar kes (-%5): {sum(1 for k in kayitlar if k['sonuc'] == '🛑')}
+⛔ Nötr kapandı: {sum(1 for k in kayitlar if k['sonuc'] == '⛔')}
+──────────────────────────
+📈 <b>SİNYAL TİPİNE GÖRE</b>
+{chr(10).join(tip_satir) if tip_satir else '—'}
+──────────────────────────
+💵 <b>FİYAT ARALIĞINA GÖRE</b>
+{chr(10).join(bant_satir) if bant_satir else '—'}
+──────────────────────────
+📅 <b>HEDEF HANGİ GÜN TUTTU</b>
+{chr(10).join(gun_satir) if gun_satir else '—'}
+──────────────────────────
+🛑 <b>ZARAR KES EŞİK KARŞILAŞTIRMASI</b>
+{chr(10).join(zk_satir)}
+──────────────────────────
+📉 <b>DÜŞÜŞ</b>
+Ortalama max düşüş: {ort_dusus}
+En kötü düşüş: {en_kotu}""", chat_id)
+        return
+
     if any(t.startswith(x) for x in ['/temizle','/tekrarsil','/dedup']):
         onayli = "onayla" in t or "onay" in t
         try:
@@ -3023,6 +3157,7 @@ Tablo yeniden sıralandı. İstatistikler artık doğru sayım üzerinden hesapl
 ⚠️ Tarih hücresi bozuk: {s.get('tarih_bozuk', 0)}
 ⏳ Günü henüz gelmemiş (bekliyor): {s.get('gun_beklemede', 0)}
 ❓ Sebebi belirsiz (loglara bakılmalı): {s.get('dokunulmadi', 0)}
+⚠️ Veri anormal (bölünme şüphesi): {s.get('anomali', 0)}
 ──────────────────────────
 Gün sütunları hâlâ boş kalıyorsa yukarıdaki uyarı satırları sebebi gösterir.
 ──────────────────────────
@@ -3060,6 +3195,7 @@ Detay için /yardim veya /help""", chat_id)
 /help — İngilizce komut listesi
 /performans — Performans tablosunu şimdi güncelle (eş değer: /tablo, /guncelle)
 /temizle — Tabloda tekrarlanan satırları temizle (önce önizleme gösterir)
+/istatistik — Sistem başarı analizi (eş değer: /stats)
 
 🔌 <b>BOT AÇ/KAPAT</b> (sadece otomatik taramayı durdurur, manuel komutlar her zaman çalışır)
 /ac — Botu aç (eş değer: /acik, /open, /basla, /turnon, /aktif)
