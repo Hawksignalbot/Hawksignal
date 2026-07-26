@@ -248,21 +248,75 @@ def get_news_id(date_str=None):
 # TELEGRAM
 # =====================
 
+TELEGRAM_MAX_LEN = 3800   # Telegram sınırı 4096; güvenlik payı bırakıyoruz
+
+
+def _mesaji_parcala(message, limit=TELEGRAM_MAX_LEN):
+    """
+    Uzun mesajı Telegram sınırının altındaki parçalara böler.
+
+    Neden gerekli: Telegram 4096 karakteri aşan mesajları reddediyor ve
+    istek 400 dönüyor — yani kullanıcıya HİÇBİR ŞEY ulaşmıyor, hata
+    yalnızca log'a yazılıyor. Uzayan raporlar (istatistik, yardım listesi,
+    geniş tarama sonuçları) bu yüzden sessizce kaybolabiliyordu.
+
+    Bölme SATIR SINIRLARINDA yapılır; böylece <b>...</b> gibi aynı satırda
+    açılıp kapanan HTML etiketleri ortadan kesilmez ve parse_mode bozulmaz.
+    Tek bir satır limitten uzunsa o satır zorunlu olarak parçalanır.
+    """
+    if message is None:
+        return []
+    if len(message) <= limit:
+        return [message]
+
+    parcalar, tampon = [], ""
+    for satir in message.split("\n"):
+        # Tek başına çok uzun satır: parçalamak zorundayız
+        while len(satir) > limit:
+            if tampon:
+                parcalar.append(tampon)
+                tampon = ""
+            parcalar.append(satir[:limit])
+            satir = satir[limit:]
+        if len(tampon) + len(satir) + 1 > limit:
+            parcalar.append(tampon)
+            tampon = satir
+        else:
+            tampon = satir if not tampon else tampon + "\n" + satir
+    if tampon:
+        parcalar.append(tampon)
+    return parcalar
+
+
 def send_telegram(message, chat_id=None, thread_id=None):
     cid = chat_id or CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": cid, "text": message, "parse_mode": "HTML"}
-    if thread_id:
+    parcalar = _mesaji_parcala(message)
+    toplam = len(parcalar)
+    for sira, parca in enumerate(parcalar, start=1):
+        metin = parca if toplam == 1 else f"{parca}\n\n— {sira}/{toplam} —"
+        payload = {"chat_id": cid, "text": metin, "parse_mode": "HTML"}
+        if thread_id:
+            try:
+                payload["message_thread_id"] = int(thread_id)
+            except (TypeError, ValueError):
+                pass
         try:
-            payload["message_thread_id"] = int(thread_id)
-        except (TypeError, ValueError):
-            pass
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code != 200:
-            print(f"[DEBUG send_telegram] BAŞARISIZ status={r.status_code} body={r.text[:300]}")
-    except Exception as e:
-        print(f"[DEBUG send_telegram] EXCEPTION: {e}")
+            r = requests.post(url, json=payload, timeout=10)
+            if r.status_code != 200:
+                print(f"[DEBUG send_telegram] BAŞARISIZ status={r.status_code} body={r.text[:300]}")
+                # HTML ayrıştırma hatasında düz metin olarak tekrar dene —
+                # mesajın hiç ulaşmamasından iyidir.
+                if r.status_code == 400:
+                    payload.pop("parse_mode", None)
+                    try:
+                        requests.post(url, json=payload, timeout=10)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[DEBUG send_telegram] EXCEPTION: {e}")
+        if toplam > 1:
+            time.sleep(0.4)   # Telegram hız sınırına takılmamak için
 
 # =====================
 # CANLI HAVUZ SİSTEMİ
