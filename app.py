@@ -640,6 +640,44 @@ def _get_tarih_format(et_dt):
         "textFormat": {"bold": True, "foregroundColor": {"red": r, "green": g, "blue": b}}
     }
 
+def _parse_sheet_number(val):
+    """
+    Google Sheets'ten metin olarak gelen sayıyı güvenli şekilde float'a çevirir.
+
+    Sheets'in yerel ayarı Türkçe olduğunda değerler virgüllü metin olarak
+    dönüyor ("2,56", "1.114,85"). Doğrudan float() çağırmak bu durumda
+    ValueError atıyor ve satır sessizce atlanıyordu — tablonun neredeyse
+    tamamının işlenmemesine yol açan asıl sebep buydu. Bu yardımcı her iki
+    biçimi (Türkçe "1.114,85" ve İngilizce "1114.85") doğru okur.
+
+    Çevrilemezse None döner (hata atmaz).
+    """
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return None
+    # Para birimi/boşluk gibi sayısal olmayan karakterleri temizle
+    s = s.replace("$", "").replace("\u00a0", "").replace(" ", "")
+    if not s:
+        return None
+    has_comma, has_dot = "," in s, "." in s
+    if has_comma and has_dot:
+        # Hangisi sonda ise ondalık ayırıcı odur (1.114,85 vs 1,114.85)
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif has_comma:
+        # Tek başına virgül: Türkçe ondalık ayırıcı kabul edilir
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
 def _get_performance_worksheet():
     """
     Google Sheets istemcisini ve çalışma sayfasını hazırlar (cache'lenir).
@@ -777,7 +815,7 @@ def update_daily_performance():
     Dönüş: tanı amaçlı özet sözlük (elle tetiklemede kullanıcıya gösterilir).
     """
     stats = {"satir": 0, "islenen": 0, "hucre": 0, "veri_yok": 0,
-             "tarih_yok": 0, "tamam": 0, "hata": None}
+             "tarih_yok": 0, "tamam": 0, "fiyat_okunamadi": 0, "hata": None}
 
     ws = _get_performance_worksheet()
     if ws is None:
@@ -806,12 +844,16 @@ def update_daily_performance():
                 row = row + [""] * (10 - len(row))
             tarih_str = (row[0] or "").strip()
             symbol = (row[1] or "").strip()
-            entry_price = float(row[3]) if row[3] else None
+            entry_price = _parse_sheet_number(row[3])
             gun_values = [(g or "").strip() for g in row[4:9]]  # Gün1..Gün5
             hedef = (row[9] or "").strip()
 
-            if not symbol or entry_price is None or not tarih_str:
+            if not symbol or not tarih_str:
                 continue  # boşluk satırı ya da bozuk satır
+            if entry_price is None or entry_price <= 0:
+                stats["fiyat_okunamadi"] += 1
+                print(f"[DEBUG update_daily_performance] Satır {i} ({symbol}): giriş fiyatı okunamadı -> {row[3]!r}")
+                continue
 
             stats["satir"] += 1
 
@@ -859,12 +901,10 @@ def update_daily_performance():
             hit_idx = None
             for gi, gv in enumerate(gun_values):
                 if gv:
-                    try:
-                        if float(gv.replace(",", ".")) >= target_price:
-                            hit_idx = gi
-                            break
-                    except Exception:
-                        pass
+                    gv_num = _parse_sheet_number(gv)
+                    if gv_num is not None and gv_num >= target_price:
+                        hit_idx = gi
+                        break
 
             row_touched = False
             if hit_idx is None:
@@ -2752,6 +2792,7 @@ def handle_command(text, chat_id, thread_id=None):
 ──────────────────────────
 ⚠️ Fiyat verisi alınamayan: {s['veri_yok']}
 ⚠️ Giriş tarihi veride bulunamayan: {s['tarih_yok']}
+⚠️ Giriş fiyatı okunamayan: {s.get('fiyat_okunamadi', 0)}
 ──────────────────────────
 Gün sütunları hâlâ boş kalıyorsa yukarıdaki iki uyarı satırı sebebi gösterir.""", chat_id)
         return
