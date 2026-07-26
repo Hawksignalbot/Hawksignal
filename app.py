@@ -3072,12 +3072,39 @@ Henüz analiz edilebilecek kapanmış satır yok.
 
         # Zarar kes eşiklerinin karşılaştırması: her eşik, hedefe ulaşmadan
         # önce kaç işlemde tetiklenmiş olurdu?
+        # Her eşik için: kaç işlem stoplanır, kaçı hedefe ulaşır ve
+        # işlem başına beklenen sonuç ne olur. Zarar kes seviyesini
+        # tahminle değil bu tabloya bakarak seçmek için.
+        def _zk_derinlik(k):
+            """Hedefe ulaşmadan önce kırılan en derin eşik (yüzde). Yoksa 0."""
+            if not k["zk"] or k["zk"] == "—":
+                return 0.0
+            v = _parse_sheet_number(k["zk"].replace("-", "").replace("%", ""))
+            return abs(v) if v is not None else 0.0
+
         zk_satir = []
+        N = len(kayitlar)
         for th in (3, 5, 10):
-            n = sum(1 for k in kayitlar if k["zk"] and k["zk"] != "—"
-                    and _parse_sheet_number(k["zk"].replace("-", "").replace("%", "")) is not None
-                    and abs(_parse_sheet_number(k["zk"].replace("-", "").replace("%", ""))) >= th)
-            zk_satir.append(f"• -%{th} eşiği: {n}/{len(kayitlar)} işlemde tetiklenirdi")
+            stoplanan = sum(1 for k in kayitlar if _zk_derinlik(k) >= th)
+            # Bu eşikle kazanan: hedefe ulaşmış VE eşik ondan önce kırılmamış
+            kazanan = sum(1 for k in kayitlar
+                          if k["gun"] and k["gun"] != "—" and _zk_derinlik(k) < th)
+            wr = kazanan / N if N else 0
+            # Yaklaşık beklenen sonuç: kazananlar +%5, stoplananlar -eşik,
+            # nötr kapananlar ~0 kabul edilir
+            notr = N - kazanan - stoplanan
+            ev = (kazanan * 5.0 + stoplanan * (-th) + notr * 0.0) / N if N else 0
+            zk_satir.append(
+                f"• <b>-%{th}</b> → {kazanan} kazanç / {stoplanan} stop / {notr} nötr\n"
+                f"   Başarı %{wr * 100:.0f} · İşlem başına <b>%{ev:+.1f}</b>"
+            )
+        # Zarar kes YOKSA (5 gün sonuna kadar tutulursa) kaç işlem hedefe ulaşırdı
+        stopsuz_kazanan = sum(1 for k in kayitlar if k["gun"] and k["gun"] != "—")
+        zk_satir.append(
+            f"• <b>Zarar kes yok</b> → {stopsuz_kazanan} işlem 5 gün içinde hedefe ulaşırdı "
+            f"(%{stopsuz_kazanan / N * 100:.0f})\n"
+            f"   ⚠️ Çıkış fiyatı bilinmediği için işlem başına sonuç hesaplanamaz"
+        )
 
         dususler = [k["dusus"] for k in kayitlar if k["dusus"] is not None]
         ort_dusus = f"%{sum(dususler) / len(dususler):.1f}" if dususler else "—"
@@ -3101,8 +3128,10 @@ Kapanmış işlem: {len(kayitlar)}
 📅 <b>HEDEF HANGİ GÜN TUTTU</b>
 {chr(10).join(gun_satir) if gun_satir else '—'}
 ──────────────────────────
-🛑 <b>ZARAR KES EŞİK KARŞILAŞTIRMASI</b>
+🛑 <b>ZARAR KES SEVİYESİ KARŞILAŞTIRMASI</b>
+(hedef sabit: +%5)
 {chr(10).join(zk_satir)}
+<i>Beklenen sonuç yaklaşıktır: kazanç +%5, stop -eşik, nötr 0 kabul edilir. Aynı gün hem stop hem hedef gerçekleşmişse kötü senaryo (stop önce) varsayılır.</i>
 ──────────────────────────
 📉 <b>DÜŞÜŞ</b>
 Ortalama max düşüş: {ort_dusus}
