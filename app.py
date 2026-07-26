@@ -743,9 +743,14 @@ def _get_performance_worksheet():
 
 def _get_last_used_date(ws):
     """
-    Sheet'te en son yazılmış tarihi bulur/cache'ler (yeni bir güne
-    geçildiğinde ayraç satırı eklemek için kullanılır). Bot yeniden
-    başlasa bile sheet'in kendisinden okuyarak devam edebilir.
+    Sheet'teki EN YENİ tarihi bulur/cache'ler (yeni bir güne geçildiğinde
+    ayraç satırı eklemek için kullanılır). Bot yeniden başlasa bile
+    sheet'in kendisinden okuyarak devam edebilir.
+
+    NOT: Tablo artık tarihe göre TERSTEN sıralanıyor (en yeni gün en üstte),
+    bu yüzden "en alt satırın tarihi" artık en yeni tarih DEĞİL — en eski
+    tarih olur. Bu nedenle son satıra bakmak yerine tüm tarihler arasından
+    en büyüğünü (en yenisini) seçiyoruz.
     """
     if _last_date_cache["date"] is not None:
         return _last_date_cache["date"]
@@ -754,14 +759,22 @@ def _get_last_used_date(ws):
     except Exception:
         all_vals = []
 
-    last_date = None
-    for row in reversed(all_vals[1:]):  # başlığı atla
-        if row and row[0].strip():
-            last_date = row[0].strip()
-            break
+    newest_dt = None
+    newest_str = None
+    for row in all_vals[1:]:  # başlığı atla
+        if not row or not row[0].strip():
+            continue
+        cand = row[0].strip()
+        try:
+            cand_dt = datetime.strptime(cand, "%d.%m.%Y")
+        except Exception:
+            continue
+        if newest_dt is None or cand_dt > newest_dt:
+            newest_dt = cand_dt
+            newest_str = cand
 
-    _last_date_cache["date"] = last_date
-    return last_date
+    _last_date_cache["date"] = newest_str
+    return newest_str
 
 def append_performance_row(symbol, entry_price, signal_type):
     """
@@ -1050,10 +1063,15 @@ def resort_performance_sheet():
         try:
             return datetime.strptime(tarih_str, "%d.%m.%Y")
         except Exception:
-            return datetime.max  # bozuk/boş tarih varsa en sona at
+            return datetime.min  # bozuk/boş tarih varsa en sona (en alta) at
 
-    # ANA sıra: tarih (kronolojik) — İKİNCİL sıra: sembol (alfabetik)
-    data_rows.sort(key=lambda r: (_parse_tarih(r[0]), r[1]))
+    # ANA sıra: tarih TERSTEN (en yeni gün en üstte, en eski gün en altta)
+    # İKİNCİL sıra: sembol (alfabetik, her tarihin kendi içinde artan)
+    # İki aşamalı sıralama: Python'un sıralaması kararlı (stable) olduğu için
+    # önce sembole göre artan dizip sonra tarihe göre azalan dizmek,
+    # "tarih azalan + sembol artan" sonucunu doğru şekilde verir.
+    data_rows.sort(key=lambda r: r[1])
+    data_rows.sort(key=lambda r: _parse_tarih(r[0]), reverse=True)
 
     # Zaten sıralıysa gereksiz yazma yapma (API kotasını korumak için)
     already_sorted_rows = []
