@@ -2865,7 +2865,12 @@ def handle_command(text, chat_id, thread_id=None):
 ⏳ Günü henüz gelmemiş (bekliyor): {s.get('gun_beklemede', 0)}
 ❓ Sebebi belirsiz (loglara bakılmalı): {s.get('dokunulmadi', 0)}
 ──────────────────────────
-Gün sütunları hâlâ boş kalıyorsa yukarıdaki iki uyarı satırı sebebi gösterir.""", chat_id)
+Gün sütunları hâlâ boş kalıyorsa yukarıdaki uyarı satırları sebebi gösterir.
+──────────────────────────
+🔗 <b>Botun yazdığı tablo:</b>
+https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit
+
+⚠️ Sadece bu bağlantıdaki tablo günceldir. Drive'a ayrıca yüklenmiş .xlsx kopyaları güncellenmez.""", chat_id)
         return
 
     if any(t.startswith(x) for x in ['/start','/durum','/status']):
