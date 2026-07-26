@@ -607,6 +607,13 @@ _FMT_GUN_HEDEF_TUTTU = {
     "horizontalAlignment": "RIGHT", "verticalAlignment": "MIDDLE",
     "textFormat": {"bold": True, "foregroundColor": {"red": 0.06, "green": 0.42, "blue": 0.13}}
 }
+# Hedef (%5) tutulduktan SONRAKİ gün hücreleri: dümdüz yeşil arka plan.
+# Takip o gün kapandığı için değer yazılmaz, sadece görsel olarak
+# "bu satır hedefi tuttu" bakışta anlaşılsın diye boyanır.
+_FMT_GUN_HEDEF_SONRASI = {
+    "horizontalAlignment": "RIGHT", "verticalAlignment": "MIDDLE",
+    "backgroundColor": {"red": 0.06, "green": 0.42, "blue": 0.13}
+}
 # Haftanın gününe göre tarih hücresi rengi (arka fon hep siyah, yazı rengi değişir)
 _TARIH_GUN_RENKLERI = {
     0: (1.0, 1.0, 1.0),         # Pazartesi - beyaz
@@ -745,63 +752,85 @@ def append_performance_row(symbol, entry_price, signal_type):
 
 def update_daily_performance():
     """
-    Her işlem günü kapanışından sonra bir kez çağrılır. Her açık satır
-    (Hedef sütunu boş) için, GERÇEK giriş tarihinden (Tarih sütunu)
-    itibaren geçen işlem günü sayısına göre Gün1-5 sütunlarını DOĞRU
-    tarihsel Yüksek (High) fiyatlarıyla doldurur.
+    Her işlem günü kapanışından sonra bir kez çağrılır (ayrıca /performans
+    komutuyla elle tetiklenebilir). Her satır için, GERÇEK giriş tarihinden
+    (Tarih sütunu) itibaren gelen işlem günlerine göre Gün1-5 sütunlarını
+    DOĞRU tarihsel Yüksek (High) fiyatlarıyla doldurur.
 
-    ÖNEMLİ: Artık "bugünün fiyatı" her satırın bir sonraki boş sütununa
-    körlemesine yazılmıyor — hangi Gün sütunu hangi takvim gününe denk
-    geliyorsa, o günün gerçek tarihsel OHLCV verisi kullanılıyor
-    (entry_date + N. işlem günü). Bu sayede bot bir süre çalışmasa bile
-    (ör. Railway hesabının dondurulması) tekrar başladığında atlanan
-    günler otomatik ve doğru şekilde geriye dönük tamamlanır (backfill) —
-    ayrı bir manuel müdahaleye gerek kalmaz.
+    ÖNEMLİ: "bugünün fiyatı" bir sonraki boş sütuna körlemesine yazılmıyor —
+    hangi Gün sütunu hangi takvim gününe denk geliyorsa, o günün gerçek
+    tarihsel OHLCV verisi kullanılıyor (giriş tarihi + N. işlem günü). Bu
+    sayede bot bir süre hiç çalışmasa bile (ör. Railway hesabının
+    dondurulması) tekrar başladığında atlanan günler otomatik ve doğru
+    şekilde geriye dönük tamamlanır (backfill).
 
-    - Fiyat giriş fiyatının %5 üstüne ulaştıysa ✅ ile işaretlenir ve o
-      günün hücresi koyu yeşil yapılır; hedef tutan günden sonrası
-      doldurulmaz (satır kapanır).
-    - 5. gün de dolduysa ve hedefe hiç ulaşılmadıysa ⛔ ile işaretlenir.
+    ONARIM: Hedef sütunu (✅/⛔) dolu olmasına rağmen Gün sütunları boş
+    kalmış eski/bozuk satırlar da tamir edilir — eskiden bu satırlar
+    "tamamlanmış" sayılıp sonsuza kadar boş kalıyordu.
+
+    - Fiyat giriş fiyatının %5 üstüne ulaştığı gün ✅ yazılır, o günün
+      hücresi koyu yeşil yazı ile vurgulanır.
+    - Hedef tutulduktan SONRAKİ gün hücreleri dümdüz yeşil arka planla
+      boyanır (değer yazılmaz) — hedefi tutan satırlar bakışta belli olur.
+    - 5. gün de dolduğu halde hedefe hiç ulaşılmadıysa ⛔ yazılır.
+
+    Dönüş: tanı amaçlı özet sözlük (elle tetiklemede kullanıcıya gösterilir).
     """
+    stats = {"satir": 0, "islenen": 0, "hucre": 0, "veri_yok": 0,
+             "tarih_yok": 0, "tamam": 0, "hata": None}
+
     ws = _get_performance_worksheet()
     if ws is None:
-        return
+        stats["hata"] = "Google Sheets bağlantısı kurulamadı (kimlik bilgisi/ID eksik olabilir)"
+        return stats
     try:
         all_rows = ws.get_all_values()
     except Exception as e:
         print(f"[DEBUG update_daily_performance] Sheet okunamadı: {e}")
-        return
+        stats["hata"] = f"Sheet okunamadı: {e}"
+        return stats
 
     if len(all_rows) <= 1:
-        return  # Sadece başlık var, takip edilecek satır yok
+        stats["hata"] = "Tabloda başlık dışında satır yok"
+        return stats
 
-    updates = []       # (row, col, value)
-    green_cells = []   # a1 aralıkları - hedefi tutan gün hücreleri
-    ohlcv_cache = {}   # symbol -> df (bu turda semboller arası tekrar çekmemek için)
+    updates = []        # (row, col, value)
+    hit_cells = []      # hedefi tutan gün hücreleri (koyu yeşil yazı)
+    after_cells = []    # hedef sonrası gün hücreleri (dümdüz yeşil zemin)
+    ohlcv_cache = {}    # symbol -> df (aynı sembolü bu turda tekrar çekmemek için)
     today_et_date = get_us_eastern_now().date()
 
     for i, row in enumerate(all_rows[1:], start=2):  # 1. satır başlık
         try:
             if len(row) < 10:
                 row = row + [""] * (10 - len(row))
-            tarih_str = row[0]
-            symbol = row[1]
+            tarih_str = (row[0] or "").strip()
+            symbol = (row[1] or "").strip()
             entry_price = float(row[3]) if row[3] else None
-            gun_values = row[4:9]  # Gün1..Gün5
-            hedef = row[9]
+            gun_values = [(g or "").strip() for g in row[4:9]]  # Gün1..Gün5
+            hedef = (row[9] or "").strip()
 
-            if not symbol or entry_price is None or hedef or not tarih_str:
-                continue  # Zaten tamamlanmış, boşluk satırı ya da bozuk satır
+            if not symbol or entry_price is None or not tarih_str:
+                continue  # boşluk satırı ya da bozuk satır
+
+            stats["satir"] += 1
+
+            # Hedef dolu VE en az bir gün değeri yazılmışsa bu satır gerçekten
+            # tamamlanmış demektir — API kotasını korumak için dokunmuyoruz.
+            # Hedef dolu ama TÜM günler boşsa (eski bozuk satırlar) onarılır.
+            if hedef and any(gun_values):
+                stats["tamam"] += 1
+                continue
 
             try:
                 entry_date = datetime.strptime(tarih_str, "%d.%m.%Y").date()
             except Exception:
-                continue  # Bozuk tarih, güvenli şekilde atla
+                continue  # bozuk tarih, güvenli şekilde atla
 
-            # Giriş tarihinden bugüne kaç takvim günü geçmiş - o kadarını
-            # kapsayacak yeterli tarihsel veri çekmek için pay bırakıyoruz
-            # (hafta sonu/tatil günleri de takvim gününe dahil olduğundan
-            # işlem günü sayısı her zaman daha az olur, fazladan pay güvenlidir).
+            # Giriş tarihinden bugüne kaç takvim günü geçmiş — o aralığı
+            # kapsayacak kadar tarihsel veri çekiyoruz. Hafta sonu/tatiller de
+            # takvim gününe dahil olduğu için işlem günü sayısı daima daha az
+            # olur; fazladan pay bırakmak güvenlidir.
             days_since_entry = max((today_et_date - entry_date).days, 0)
             needed_size = min(max(25, days_since_entry + 15), 300)
 
@@ -809,14 +838,17 @@ def update_daily_performance():
                 ohlcv_cache[symbol] = td_get_ohlcv(symbol, outputsize=needed_size)
             df = ohlcv_cache[symbol]
             if df is None or len(df) == 0:
-                print(f"[DEBUG update_daily_performance] {symbol}: veri alınamadı, bu satır bu turda atlandı.")
+                print(f"[DEBUG update_daily_performance] {symbol}: veri alınamadı, satır {i} atlandı.")
+                stats["veri_yok"] += 1
                 continue
 
             df_dates = df["Date"].dt.date
             entry_matches = df.index[df_dates == entry_date].tolist()
             if not entry_matches:
-                # Giriş tarihi çekilen veri aralığında yok (ör. kaynak henüz
-                # o günü içermiyor) - bu turda atla, sonraki turda tekrar denenir
+                # Giriş tarihi çekilen veri aralığında yok (kaynak o günü
+                # içermiyor) — bu turda atla, sonraki turda tekrar denenir.
+                print(f"[DEBUG update_daily_performance] {symbol}: giriş tarihi {tarih_str} veride bulunamadı, satır {i} atlandı.")
+                stats["tarih_yok"] += 1
                 continue
             entry_idx = entry_matches[0]
 
@@ -824,38 +856,68 @@ def update_daily_performance():
             following = df.iloc[entry_idx + 1: entry_idx + 6].reset_index(drop=True)
 
             target_price = entry_price * 1.05
-            already_hit = any(float(g) >= target_price for g in gun_values if g)
+            hit_idx = None
+            for gi, gv in enumerate(gun_values):
+                if gv:
+                    try:
+                        if float(gv.replace(",", ".")) >= target_price:
+                            hit_idx = gi
+                            break
+                    except Exception:
+                        pass
 
-            for gi in range(5):
-                if gun_values[gi]:
-                    continue  # bu gün zaten dolu, dokunma
-                if gi >= len(following):
-                    break  # bu Gün'ün takvim tarihi henüz gelmedi/veri yok
-                day_high = float(following.iloc[gi]["High"])
-                col_index = 5 + gi  # Gün1 = E = 5. kolon (1-based)
-                updates.append((i, col_index, round(day_high, 2)))
+            row_touched = False
+            if hit_idx is None:
+                for gi in range(5):
+                    if gun_values[gi]:
+                        continue  # bu gün zaten dolu, dokunma
+                    if gi >= len(following):
+                        break  # bu Gün'ün takvim tarihi henüz gelmedi / veri yok
+                    day_high = float(following.iloc[gi]["High"])
+                    col_index = 5 + gi  # Gün1 = E = 5. kolon (1-based)
+                    updates.append((i, col_index, round(day_high, 2)))
+                    row_touched = True
 
-                if day_high >= target_price and not already_hit:
-                    updates.append((i, 10, "✅"))
-                    green_cells.append(gspread.utils.rowcol_to_a1(i, col_index))
-                    already_hit = True
-                    break  # hedef tuttu, sonraki günleri doldurmaya gerek yok
-                elif gi == 4:
-                    updates.append((i, 10, "⛔"))
+                    if day_high >= target_price:
+                        if hedef != "✅":
+                            updates.append((i, 10, "✅"))
+                        hit_cells.append(gspread.utils.rowcol_to_a1(i, col_index))
+                        hit_idx = gi
+                        break  # hedef tuttu, takip bu satır için kapandı
+                    elif gi == 4 and hedef != "⛔":
+                        updates.append((i, 10, "⛔"))
+
+            # Hedef tutulduysa, sonraki gün hücrelerini dümdüz yeşil boya
+            if hit_idx is not None:
+                for gi in range(hit_idx + 1, 5):
+                    after_cells.append(gspread.utils.rowcol_to_a1(i, 5 + gi))
+                row_touched = True
+
+            if row_touched:
+                stats["islenen"] += 1
         except Exception as e:
             print(f"[DEBUG update_daily_performance] Satır {i} işlenirken hata: {e}")
             continue
 
-    if not updates:
-        return
+    stats["hucre"] = len(updates)
+
+    if not updates and not hit_cells and not after_cells:
+        return stats
     try:
-        cell_updates = [{"range": gspread.utils.rowcol_to_a1(r, c), "values": [[v]]} for r, c, v in updates]
-        ws.batch_update(cell_updates, value_input_option="USER_ENTERED")
-        for a1 in green_cells:
+        if updates:
+            cell_updates = [{"range": gspread.utils.rowcol_to_a1(r, c), "values": [[v]]} for r, c, v in updates]
+            ws.batch_update(cell_updates, value_input_option="USER_ENTERED")
+        for a1 in hit_cells:
             ws.format(a1, _FMT_GUN_HEDEF_TUTTU)
-        print(f"[DEBUG update_daily_performance] {len(updates)} hücre güncellendi ({len(green_cells)} hedef tuttu)")
+        for a1 in after_cells:
+            ws.format(a1, _FMT_GUN_HEDEF_SONRASI)
+        print(f"[DEBUG update_daily_performance] {len(updates)} hücre güncellendi "
+              f"({len(hit_cells)} hedef tuttu, {len(after_cells)} hücre yeşil boyandı)")
     except Exception as e:
         print(f"[DEBUG update_daily_performance] Toplu güncelleme hatası: {e}")
+        stats["hata"] = f"Yazma hatası: {e}"
+    return stats
+
 
 def resort_performance_sheet():
     """
@@ -2662,6 +2724,38 @@ def handle_command(text, chat_id, thread_id=None):
         send_telegram("⛔ Bot manuel olarak KAPATILDI. Otomatik tarama durdu, kendiliğinden mesaj göndermeyecek.\nManuel komutlar (/analizet, /dalga, /formasyon vb.) hâlâ çalışır.\nTekrar açmak için: /ac (veya /başla, /turnon)", chat_id)
         return
 
+    # PERFORMANS TABLOSUNU ELLE GÜNCELLE — kapanışı beklemeden tetiklemek
+    # ve sorun olduğunda nedenini görebilmek için tanı bilgisi de döner.
+    if any(t.startswith(x) for x in ['/performans','/performance','/tablo','/guncelle']):
+        send_telegram("⏳ Performans tablosu güncelleniyor, bu işlem birkaç dakika sürebilir...", chat_id)
+        try:
+            s = update_daily_performance()
+        except Exception as e:
+            send_telegram(f"❌ Güncelleme sırasında hata: {e}", chat_id)
+            return
+        if s is None:
+            send_telegram("❌ Güncelleme çalıştı ama sonuç döndürmedi.", chat_id)
+            return
+        if s.get("hata"):
+            send_telegram(f"❌ <b>Performans tablosu güncellenemedi</b>\n\nSebep: {s['hata']}", chat_id)
+            return
+        try:
+            resort_performance_sheet()
+        except Exception as e:
+            print(f"[DEBUG /performans] resort hatası: {e}")
+        send_telegram(f"""📊 <b>PERFORMANS TABLOSU GÜNCELLENDİ</b>
+──────────────────────────
+📋 Toplam geçerli satır: {s['satir']}
+✏️ Bu turda işlenen satır: {s['islenen']}
+🔢 Yazılan/güncellenen hücre: {s['hucre']}
+✔️ Zaten tamamlanmış satır: {s['tamam']}
+──────────────────────────
+⚠️ Fiyat verisi alınamayan: {s['veri_yok']}
+⚠️ Giriş tarihi veride bulunamayan: {s['tarih_yok']}
+──────────────────────────
+Gün sütunları hâlâ boş kalıyorsa yukarıdaki iki uyarı satırı sebebi gösterir.""", chat_id)
+        return
+
     if any(t.startswith(x) for x in ['/start','/durum','/status']):
         send_telegram(f"""🦅 <b>HAWK SIGNAL BOT — NASDAQ</b>
 ──────────────────────────
@@ -2688,6 +2782,7 @@ Detay için /yardim veya /help""", chat_id)
 /liste — Havuz/tarama durumu (eş değer: /list)
 /yardim — Bu liste (eş değer: /yardım, /komutlar, /komut)
 /help — İngilizce komut listesi
+/performans — Performans tablosunu şimdi güncelle (eş değer: /tablo, /guncelle)
 
 🔌 <b>BOT AÇ/KAPAT</b> (sadece otomatik taramayı durdurur, manuel komutlar her zaman çalışır)
 /ac — Botu aç (eş değer: /acik, /open, /basla, /turnon, /aktif)
