@@ -594,7 +594,8 @@ def td_get_ohlcv(symbol, outputsize=210):
 PERFORMANCE_SHEET_HEADER = [
     "Tarih", "Sembol", "Sinyal Tipi", "Giriş Fiyatı",
     "Gün1 Max", "Gün2 Max", "Gün3 Max", "Gün4 Max", "Gün5 Max",
-    "Sonuç", "En Düşük", "Max Düşüş %", "Tuttuğu Gün", "Zarar Kes"
+    "Sonuç", "En Düşük", "Max Düşüş %", "Tuttuğu Gün", "Zarar Kes",
+    "Puan", "$ Hacim (M)", "ATR %", "Kaynak"
 ]
 _gsheet_client_cache = {"client": None, "worksheet": None}
 _last_date_cache = {"date": None}  # {"date": "08.07.2026"} - son yazılan tarih
@@ -781,7 +782,7 @@ def _get_last_used_date(ws):
     _last_date_cache["date"] = newest_str
     return newest_str
 
-def append_performance_row(symbol, entry_price, signal_type):
+def append_performance_row(symbol, entry_price, signal_type, meta=None):
     """
     Yeni bir sinyal üretildiğinde tabloya yeni bağımsız satır ekler.
     Tarih her satırda tekrar yazılır (kendi kutusunda ortalı, haftanın
@@ -819,6 +820,12 @@ def append_performance_row(symbol, entry_price, signal_type):
 
         row = ([today_str, symbol, signal_type, round(float(entry_price), 2)]
                + [""] * (len(PERFORMANCE_SHEET_HEADER) - 4))
+        # Gerekçe sütunları (Puan / $ Hacim / ATR % / Kaynak) — son 4 sütun
+        if meta:
+            row[-4] = meta.get("puan", "")
+            row[-3] = meta.get("hacim_m", "")
+            row[-2] = meta.get("atr_pct", "")
+            row[-1] = meta.get("kaynak", "")
         ws.append_row(row, value_input_option="USER_ENTERED")
 
         # Tek toplu biçimlendirme isteği (satır başına 6 ayrı çağrı yerine)
@@ -2442,7 +2449,18 @@ def analyze_stock(symbol, df=None):
 {get_ohlcv_source_label()}
 ⏰ {now_tr().strftime('%d.%m.%Y %H:%M')}
 """
-        return {"signal": msg, "info": None, "entry_price": entry}
+        return {
+            "signal": msg, "info": None, "entry_price": entry,
+            # Sinyalin GEREKÇESİ — hangi kriterin gerçekten işe yaradığını
+            # sonradan ölçebilmek için tabloya kaydedilir. Bu veri olmadan
+            # puanlama sisteminin öngörü gücü test edilemez.
+            "meta": {
+                "puan": f"{score}/14",
+                "hacim_m": round(dollar_volume / 1_000_000, 2) if dollar_volume else "",
+                "atr_pct": round(atr_now / price * 100, 2) if price else "",
+                "kaynak": last_ohlcv_source.get("source", ""),
+            },
+        }
     except Exception as e:
         import traceback
         print(f"[DEBUG analyze_stock] {symbol}: {e}")
@@ -2700,7 +2718,15 @@ def early_warning_scan(symbol, df=None):
 
 ⚠️ Bu erken bir sinyal, ana trend filtresinden geçmemiştir. Dikkatli değerlendir.
 """
-        return {"signal": msg, "info": None, "entry_price": price}
+        return {
+            "signal": msg, "info": None, "entry_price": price,
+            "meta": {
+                "puan": f"{confirmed}/7",
+                "hacim_m": round(dollar_volume / 1_000_000, 2) if dollar_volume else "",
+                "atr_pct": "",
+                "kaynak": last_ohlcv_source.get("source", ""),
+            },
+        }
     except Exception as e:
         import traceback
         print(f"[DEBUG early_warning_scan] {symbol}: {e}")
@@ -3031,10 +3057,17 @@ def handle_command(text, chat_id, thread_id=None):
             dusus = _parse_sheet_number((r[11] or "").replace("%", ""))
             gun = (r[12] or "").strip()
             zk = (r[13] or "").strip()
+            puan_raw = (r[14] or "").strip() if W > 14 else ""
+            hacim_m = _parse_sheet_number(r[15]) if W > 15 else None
             if not sembol or giris is None or sonuc not in ("✅", "🛑", "⛔"):
                 continue  # ⚠️ (anormal) ve henüz kapanmamış satırlar hariç
+            puan_val = None
+            if "/" in puan_raw:
+                puan_val = _parse_sheet_number(puan_raw.split("/")[0])
             kayitlar.append({"tip": tip, "giris": giris, "sonuc": sonuc,
-                             "dusus": dusus, "gun": gun, "zk": zk})
+                             "dusus": dusus, "gun": gun, "zk": zk,
+                             "puan": puan_val, "puan_raw": puan_raw,
+                             "hacim_m": hacim_m})
 
         if not kayitlar:
             send_telegram("""📊 <b>İSTATİSTİK</b>
@@ -3106,6 +3139,33 @@ Henüz analiz edilebilecek kapanmış satır yok.
             f"   ⚠️ Çıkış fiyatı bilinmediği için işlem başına sonuç hesaplanamaz"
         )
 
+        # PUAN-BAŞARI İLİŞKİSİ — bu sistemin çekirdek testi.
+        # Yüksek puanlı sinyaller düşük puanlılardan daha iyi sonuç
+        # vermiyorsa, 14 kriterli puanlama sistemi dekoratiftir.
+        puanli = [k for k in kayitlar if k["puan"] is not None]
+        puan_satir = []
+        if len(puanli) < 10:
+            puan_satir.append(f"• Yeterli veri yok ({len(puanli)} kayıt). "
+                              "Puan sütunu yeni eklendi; yeni sinyaller biriktikçe dolacak.")
+        else:
+            gruplar = {}
+            for k in puanli:
+                gruplar.setdefault(k["puan_raw"], []).append(k)
+            for pr in sorted(gruplar, key=lambda x: -(_parse_sheet_number(x.split("/")[0]) or 0)):
+                puan_satir.append(f"• Puan {pr}: {oran(gruplar[pr])}")
+
+        # LİKİDİTE KIRILIMI — makas maliyeti düşük hacimde başarıyı yer
+        hacimli = [k for k in kayitlar if k["hacim_m"] is not None]
+        hacim_satir = []
+        if len(hacimli) < 10:
+            hacim_satir.append(f"• Yeterli veri yok ({len(hacimli)} kayıt).")
+        else:
+            for ad, lo, hi in [("< 1 M$", 0, 1), ("1-10 M$", 1, 10),
+                               ("10-100 M$", 10, 100), ("100 M$ +", 100, 10 ** 9)]:
+                g = [k for k in hacimli if lo <= k["hacim_m"] < hi]
+                if g:
+                    hacim_satir.append(f"• {ad}: {oran(g)}")
+
         dususler = [k["dusus"] for k in kayitlar if k["dusus"] is not None]
         ort_dusus = f"%{sum(dususler) / len(dususler):.1f}" if dususler else "—"
         en_kotu = f"%{min(dususler):.1f}" if dususler else "—"
@@ -3133,9 +3193,19 @@ Kapanmış işlem: {len(kayitlar)}
 {chr(10).join(zk_satir)}
 <i>Beklenen sonuç yaklaşıktır: kazanç +%5, stop -eşik, nötr 0 kabul edilir. Aynı gün hem stop hem hedef gerçekleşmişse kötü senaryo (stop önce) varsayılır.</i>
 ──────────────────────────
+🧪 <b>PUAN — BAŞARI İLİŞKİSİ</b>
+(yüksek puan daha iyi sonuç vermiyorsa puanlama işe yaramıyor)
+{chr(10).join(puan_satir)}
+──────────────────────────
+💧 <b>LİKİDİTEYE GÖRE</b>
+(düşük hacimde makas maliyeti kazancı yer)
+{chr(10).join(hacim_satir)}
+──────────────────────────
 📉 <b>DÜŞÜŞ</b>
 Ortalama max düşüş: {ort_dusus}
-En kötü düşüş: {en_kotu}""", chat_id)
+En kötü düşüş: {en_kotu}
+──────────────────────────
+<i>⚠️ Tüm rakamlar işlem maliyeti (komisyon + alış-satış makası + kayma) HARİÇTİR. Likit hisselerde gidiş-dönüş yaklaşık %0,4; düşük hacimli mikro-hisselerde %2-5 olabilir. Gerçek sonuç bu tablodan daha kötüdür.</i>""", chat_id)
         return
 
     if any(t.startswith(x) for x in ['/temizle','/tekrarsil','/dedup']):
@@ -4052,7 +4122,8 @@ def auto_scan_loop():
                             # ÖNCE yapılır — Sheets zaten "bugün loglanmış" derse
                             # (örn. Railway restart sonrası bellek sıfırlanmış olsa
                             # bile) Telegram'a da tekrar mesaj gitmez.
-                            logged = append_performance_row(ticker, result.get("entry_price"), "Trend Sinyali")
+                            logged = append_performance_row(ticker, result.get("entry_price"),
+                                                            "Trend Sinyali", result.get("meta"))
                             if logged:
                                 send_kanal(result["signal"], "trend")
                                 send_news_for_signal(ticker, "Trend Sinyali")
@@ -4066,7 +4137,8 @@ def auto_scan_loop():
                     if result and result.get("signal"):
                         signal_key = f"erkenuyari:{ticker}"
                         if signal_key not in _recently_signaled:
-                            logged = append_performance_row(ticker, result.get("entry_price"), "Erken Uyarı")
+                            logged = append_performance_row(ticker, result.get("entry_price"),
+                                                            "Erken Uyarı", result.get("meta"))
                             if logged:
                                 send_kanal(result["signal"], "erkenuyari")
                                 send_news_for_signal(ticker, "Erken Uyarı")
