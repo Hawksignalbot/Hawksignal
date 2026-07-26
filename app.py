@@ -842,7 +842,8 @@ def update_daily_performance():
     Dönüş: tanı amaçlı özet sözlük (elle tetiklemede kullanıcıya gösterilir).
     """
     stats = {"satir": 0, "islenen": 0, "hucre": 0, "veri_yok": 0,
-             "tarih_yok": 0, "tamam": 0, "fiyat_okunamadi": 0, "hata": None}
+             "tarih_yok": 0, "tamam": 0, "fiyat_okunamadi": 0,
+             "tarih_bozuk": 0, "gun_beklemede": 0, "dokunulmadi": 0, "hata": None}
 
     ws = _get_performance_worksheet()
     if ws is None:
@@ -894,7 +895,9 @@ def update_daily_performance():
             try:
                 entry_date = datetime.strptime(tarih_str, "%d.%m.%Y").date()
             except Exception:
-                continue  # bozuk tarih, güvenli şekilde atla
+                stats["tarih_bozuk"] += 1
+                print(f"[DEBUG update_daily_performance] Satır {i} ({symbol}): tarih okunamadı -> {tarih_str!r}")
+                continue
 
             # Giriş tarihinden bugüne kaç takvim günü geçmiş — o aralığı
             # kapsayacak kadar tarihsel veri çekiyoruz. Hafta sonu/tatiller de
@@ -934,12 +937,17 @@ def update_daily_performance():
                         break
 
             row_touched = False
+            bekleyen_gun = False   # veri henüz gelmediği için doldurulamayan gün var mı
+            bos_gun_kaldi = False  # doldurulamamış (boş) gün kaldı mı
             if hit_idx is None:
                 for gi in range(5):
                     if gun_values[gi]:
                         continue  # bu gün zaten dolu, dokunma
                     if gi >= len(following):
-                        break  # bu Gün'ün takvim tarihi henüz gelmedi / veri yok
+                        # Bu Gün'ün takvim tarihi henüz gelmedi ya da kaynakta veri yok
+                        bekleyen_gun = True
+                        bos_gun_kaldi = True
+                        break
                     day_high = float(following.iloc[gi]["High"])
                     col_index = 5 + gi  # Gün1 = E = 5. kolon (1-based)
                     updates.append((i, col_index, round(day_high, 2)))
@@ -954,6 +962,15 @@ def update_daily_performance():
                     elif gi == 4 and hedef != "⛔":
                         updates.append((i, 10, "⛔"))
 
+                # TAMAMLAMA BOŞLUĞU: 5 günün tamamı dolu, hedef hiç tutmamış,
+                # ama Hedef sütunu boş kalmış satırlar (önceki sürümlerin
+                # kalıntısı) burada ⛔ ile kapatılır — eskiden bu satırlar
+                # sonsuza kadar "işlenmedi" durumunda takılı kalıyordu.
+                if (hit_idx is None and not bos_gun_kaldi
+                        and all(gun_values) and not hedef):
+                    updates.append((i, 10, "⛔"))
+                    row_touched = True
+
             # Hedef tutulduysa, sonraki gün hücrelerini dümdüz yeşil boya
             if hit_idx is not None:
                 for gi in range(hit_idx + 1, 5):
@@ -962,6 +979,12 @@ def update_daily_performance():
 
             if row_touched:
                 stats["islenen"] += 1
+            elif bekleyen_gun:
+                stats["gun_beklemede"] += 1
+            else:
+                stats["dokunulmadi"] += 1
+                print(f"[DEBUG update_daily_performance] Satır {i} ({symbol}, {tarih_str}): "
+                      f"dokunulmadı. gunler={gun_values} hedef={hedef!r} veri_gun={len(following)}")
         except Exception as e:
             print(f"[DEBUG update_daily_performance] Satır {i} işlenirken hata: {e}")
             continue
@@ -2838,6 +2861,9 @@ def handle_command(text, chat_id, thread_id=None):
 ⚠️ Fiyat verisi alınamayan: {s['veri_yok']}
 ⚠️ Giriş tarihi veride bulunamayan: {s['tarih_yok']}
 ⚠️ Giriş fiyatı okunamayan: {s.get('fiyat_okunamadi', 0)}
+⚠️ Tarih hücresi bozuk: {s.get('tarih_bozuk', 0)}
+⏳ Günü henüz gelmemiş (bekliyor): {s.get('gun_beklemede', 0)}
+❓ Sebebi belirsiz (loglara bakılmalı): {s.get('dokunulmadi', 0)}
 ──────────────────────────
 Gün sütunları hâlâ boş kalıyorsa yukarıdaki iki uyarı satırı sebebi gösterir.""", chat_id)
         return
