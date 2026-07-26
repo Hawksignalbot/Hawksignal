@@ -950,8 +950,12 @@ def append_performance_row(symbol, entry_price, signal_type, meta=None, tarih_ov
         last_date = _get_last_used_date(ws)
 
         if last_date is not None and last_date != today_str:
-            ws.append_row([""] * len(PERFORMANCE_SHEET_HEADER),
-                          value_input_option="USER_ENTERED")  # gün arası boşluk
+            _bos_index = len(ws.get_all_values()) + 1   # gün arası boşluk
+            _sk0 = gspread.utils.rowcol_to_a1(1, len(PERFORMANCE_SHEET_HEADER))[0]
+            _sheets_call_with_retry(lambda: ws.update(
+                f"A{_bos_index}:{_sk0}{_bos_index}",
+                [[""] * len(PERFORMANCE_SHEET_HEADER)],
+                value_input_option="USER_ENTERED"))
 
         all_vals = ws.get_all_values()
 
@@ -970,7 +974,10 @@ def append_performance_row(symbol, entry_price, signal_type, meta=None, tarih_ov
             row[-3] = meta.get("hacim_m", "")
             row[-2] = meta.get("atr_pct", "")
             row[-1] = meta.get("kaynak", "")
-        ws.append_row(row, value_input_option="USER_ENTERED")
+        _sk = gspread.utils.rowcol_to_a1(1, len(PERFORMANCE_SHEET_HEADER))[0]
+        _sheets_call_with_retry(lambda: ws.update(
+            f"A{new_row_index}:{_sk}{new_row_index}", [row],
+            value_input_option="USER_ENTERED"))
 
         # Tek toplu biçimlendirme isteği (satır başına 6 ayrı çağrı yerine)
         son_kolon = gspread.utils.rowcol_to_a1(1, len(PERFORMANCE_SHEET_HEADER))[0]
@@ -1329,6 +1336,81 @@ def cleanup_duplicate_rows(dry_run=True):
               f"{rapor['kalan']} satır kaldı.")
     except Exception as e:
         print(f"[DEBUG cleanup_duplicate_rows] Yazma hatası: {e}")
+        rapor["hata"] = f"Yazma hatası: {e}"
+    return rapor
+
+
+def bozuk_kaymis_satirlari_sil():
+    """
+    KAYMIŞ satırları temizler: Tarih sütunu (A) boş olmasına rağmen ileride
+    bir yerde veri barındıran satırlar.
+
+    Nedeni: sütun sayısı 10'dan 18'e çıkarıldığında gspread'in append_row
+    çağrısı yeni satırı A sütununa değil, önceki satırın SAĞINA eklemeye
+    başladı. Sonuçta veri sağa kaydı, Tarih sütunu boş kaldı ve bu satırlar
+    kodun tamamına görünmez oldu (satır sayısı hiç artmıyordu).
+
+    Bu satırlar onarılamaz değil ama içerdikleri bilgi (tarih/sembol/fiyat)
+    /kiyas ile yeniden üretilebilir olduğundan, karmaşık bir hizalama
+    denemesi yerine güvenli olan yol seçiliyor: siliniyorlar.
+    """
+    rapor = {"silinen": 0, "kalan": 0, "hata": None}
+    ws = _get_performance_worksheet()
+    if ws is None:
+        rapor["hata"] = "Google Sheets bağlantısı kurulamadı"
+        return rapor
+    try:
+        all_rows = ws.get_all_values()
+    except Exception as e:
+        rapor["hata"] = f"Sheet okunamadı: {e}"
+        return rapor
+    if len(all_rows) <= 1:
+        return rapor
+
+    W = len(PERFORMANCE_SHEET_HEADER)
+    korunan = []
+    for row in all_rows[1:]:
+        dolu_hucreler = [c for c in row if (c or "").strip()]
+        if not dolu_hucreler:
+            continue  # tamamen boş ayraç satırı
+        tarih_bos = not (row[0] or "").strip() if len(row) > 0 else True
+        if tarih_bos:
+            # Tarih boş ama veri var -> kaymış satır
+            rapor["silinen"] += 1
+            continue
+        korunan.append((row + [""] * W)[:W])
+
+    rapor["kalan"] = len(korunan)
+    if rapor["silinen"] == 0:
+        return rapor
+
+    def _pt(x):
+        try:
+            return datetime.strptime((x or "").strip(), "%d.%m.%Y")
+        except Exception:
+            return datetime.min
+    korunan.sort(key=lambda r: (r[1] or ""))
+    korunan.sort(key=lambda r: _pt(r[0]), reverse=True)
+
+    final_rows, son = [], None
+    for row in korunan:
+        if son is not None and row[0] != son:
+            final_rows.append([""] * W)
+        final_rows.append(row)
+        son = row[0]
+
+    sk = gspread.utils.rowcol_to_a1(1, W)[0]
+    try:
+        # Kaymış veri çok sağa gitmiş olabileceği için geniş bir alanı temizle
+        _sheets_call_with_retry(lambda: ws.batch_clear([f"A2:ZZ{len(all_rows) + 10}"]))
+        _sheets_call_with_retry(
+            lambda: ws.update(f"A2:{sk}{len(final_rows) + 1}", final_rows,
+                              value_input_option="USER_ENTERED")
+        )
+        _last_date_cache["date"] = None
+        print(f"[DEBUG bozuk_kaymis_satirlari_sil] {rapor['silinen']} kaymış satır silindi")
+    except Exception as e:
+        print(f"[DEBUG bozuk_kaymis_satirlari_sil] Yazma hatası: {e}")
         rapor["hata"] = f"Yazma hatası: {e}"
     return rapor
 
@@ -3551,6 +3633,32 @@ En kötü düşüş: {en_kotu}
 <i>⚠️ Tüm rakamlar işlem maliyeti (komisyon + alış-satış makası + kayma) HARİÇTİR. Likit hisselerde gidiş-dönüş yaklaşık %0,4; düşük hacimli mikro-hisselerde %2-5 olabilir. Gerçek sonuç bu tablodan daha kötüdür.</i>""", chat_id)
         return
 
+    # KAYMIŞ SATIR ONARIMI
+    if any(t.startswith(x) for x in ['/onar','/duzelt','/repair']):
+        r = bozuk_kaymis_satirlari_sil()
+        if r.get("hata"):
+            send_telegram(f"❌ Onarım yapılamadı: {r['hata']}", chat_id)
+            return
+        if r["silinen"] == 0:
+            send_telegram(f"""✨ <b>ONARIM GEREKMİYOR</b>
+──────────────────────────
+Kaymış/bozuk satır bulunamadı.
+📋 Toplam satır: {r['kalan']}""", chat_id)
+            return
+        try:
+            resort_performance_sheet()
+        except Exception as e:
+            print(f"[DEBUG /onar] resort hatası: {e}")
+        send_telegram(f"""🔧 <b>ONARIM TAMAMLANDI</b>
+──────────────────────────
+🗑️ Silinen kaymış satır: {r['silinen']}
+📋 Kalan satır: {r['kalan']}
+──────────────────────────
+Bu satırlarda veri A sütunu yerine sağa kaymıştı, bu yüzden bot onları hiç görmüyordu.
+
+Kıyas örneğini /kiyas 15 ile yeniden alabilirsin — artık doğru yazılacak.""", chat_id)
+        return
+
     if any(t.startswith(x) for x in ['/temizle','/tekrarsil','/dedup']):
         onayli = "onayla" in t or "onay" in t
         try:
@@ -3684,6 +3792,10 @@ Her sinyal, kendi giriş fiyatıyla tabloya ayrı bir satır olarak yazılır ve
 /kiyas sil — İşlem günü olmayan tarihe kaydedilmiş, ölçülemez kıyas satırlarını siler
    Havuzdan rastgele hisseleri sinyal üretmeden tabloya işler. Sinyallerin rastgele seçimden daha iyi olup olmadığını ölçmenin tek yolu budur.
 
+/onar — Kaymış/bozuk satırları temizle
+   (eş değer: /duzelt, /repair)
+   Tarih sütunu boş kalmış, veri sağa kaymış satırları siler. Bu satırlar bot tarafından görülmediği için satır sayısı yanlış görünür.
+
 /temizle — Tekrarlanan satırları sil
    (eş değer: /tekrarsil, /dedup)
    Aynı Tarih + Sembol + Sinyal Tipi olan satırlardan sadece en dolu olanı bırakır. İlk yazımda ÖNİZLEME gösterir; gerçekten silmek için <code>/temizle onayla</code> yazılmalıdır. Geri alınamaz.
@@ -3783,6 +3895,9 @@ Every signal gets its own row with its own entry price and is tracked for 5 trad
 /kiyas [n] — Take a random benchmark sample
    (aliases: /benchmark, /rastgele — default 10, max 30)
    Logs random pool symbols without generating signals, measured by identical rules.
+
+/onar — Clean up shifted/corrupted rows
+   (aliases: /duzelt, /repair)
 
 /temizle — Remove duplicate rows
    (aliases: /tekrarsil, /dedup)
