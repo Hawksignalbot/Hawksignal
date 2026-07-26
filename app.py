@@ -3322,6 +3322,140 @@ def normalize_text(text):
 # KOMUT İŞLEYİCİ
 # =====================
 
+def rastgele_kiyas_ornegi_al(adet=15, tarih=None):
+    """
+    Havuzdan rastgele seçilmiş hisseleri, sinyal üretmeden, gerçek
+    sinyallerle AYNI kurallarla performans tablosuna işler.
+
+    Neden gerekli: oynak bir mikro-hissenin 5 gün içinde %5 yükselmesi
+    zaten yüksek olasılıktır. Sinyalin başarı oranı bu rastgele orandan
+    belirgin şekilde yüksek DEĞİLSE, sistem değer üretmiyor demektir.
+    Kıyas ölçütü olmadan hiçbir başarı oranı yorumlanamaz.
+
+    BAĞIMSIZLIK: o tarihte zaten gerçek sinyal üretmiş semboller havuzdan
+    çıkarılır. Aksi halde aynı hisse aynı fiyatla iki grupta da yer alır,
+    sonuçlar birebir aynı çıkar ve kıyas "fark yok" yönüne çekilerek
+    sistemi haksız yere iyi gösterir.
+
+    Dönüş: {"tarih", "sarildi", "eklenen", "atlanan", "haric", "hata"}
+    """
+    sonuc = {"tarih": None, "sarildi": False, "eklenen": [], "atlanan": [],
+             "haric": 0, "hata": None}
+
+    if tarih is None:
+        tarih, sonuc["sarildi"] = son_islem_gunu()
+    sonuc["tarih"] = tarih
+    tarih_str = tarih.strftime("%d.%m.%Y")
+
+    havuz = get_raw_trading_pool()
+    if not havuz:
+        sonuc["hata"] = "Havuz alınamadı"
+        return sonuc
+
+    haric = set()
+    try:
+        ws_k = _get_performance_worksheet()
+        if ws_k is not None:
+            for r in ws_k.get_all_values()[1:]:
+                if len(r) >= 3 and (r[0] or "").strip() == tarih_str \
+                        and (r[2] or "").strip() != "Rastgele (Kıyas)":
+                    haric.add((r[1] or "").strip())
+    except Exception as e:
+        print(f"[DEBUG rastgele_kiyas_ornegi_al] hariç listesi okunamadı: {e}")
+    sonuc["haric"] = len(haric)
+
+    uygun = [h for h in havuz if h not in haric]
+    if not uygun:
+        sonuc["hata"] = f"{tarih_str} tarihinde havuzdaki tüm semboller sinyal üretmiş"
+        return sonuc
+
+    for tk in random.sample(uygun, min(adet, len(uygun))):
+        try:
+            df_k = td_get_ohlcv(tk, outputsize=30)
+            if df_k is None or len(df_k) == 0:
+                sonuc["atlanan"].append(tk)
+                continue
+            fiyat = float(df_k["Close"].iloc[-1])
+            hacim = float(df_k["Volume"].iloc[-1]) * fiyat
+            meta_k = {
+                "puan": "—",
+                "hacim_m": round(hacim / 1_000_000, 2),
+                "atr_pct": "",
+                "kaynak": last_ohlcv_source.get("source", ""),
+            }
+            if append_performance_row(tk, fiyat, "Rastgele (Kıyas)", meta_k,
+                                      tarih_override=tarih):
+                sonuc["eklenen"].append(f"{tk} ${fiyat:.2f}")
+            else:
+                sonuc["atlanan"].append(tk)
+        except Exception as e:
+            print(f"[DEBUG rastgele_kiyas_ornegi_al] {tk}: {e}")
+            sonuc["atlanan"].append(tk)
+
+    if sonuc["eklenen"]:
+        try:
+            resort_performance_sheet()
+        except Exception as e:
+            print(f"[DEBUG rastgele_kiyas_ornegi_al] resort hatası: {e}")
+    return sonuc
+
+
+# OTOMATİK GÜNLÜK KIYAS ÖRNEĞİ
+# Kapanış sonrası (16:00 ET) her işlem günü bir kez çalışır. Elle
+# çalıştırmaya göre metodolojik olarak DAHA İYİ: giriş fiyatı her zaman o
+# günün gerçek kapanışı olur, gün içinde hangi saatte çalıştırıldığına
+# bağlı olarak değişmez — yani ölçüm tekrarlanabilir hale gelir.
+#
+# Ortam değişkeni ile ayarlanır (Railway):
+#   KIYAS_OTOMATIK=0   -> kapatır (varsayılan: açık)
+#   KIYAS_ADET=15      -> günlük örnek adedi (varsayılan 15)
+_last_benchmark_date = {"date": None}
+
+
+def maybe_run_daily_benchmark():
+    """
+    Piyasa kapanışından sonra, o gün için henüz alınmadıysa günlük
+    rastgele kıyas örneğini alır. auto_scan_loop'un her turunda
+    çağrılması güvenlidir — günde bir kereden fazla çalışmaz.
+    """
+    try:
+        if os.environ.get("KIYAS_OTOMATIK", "1") == "0":
+            return
+        if not bot_manual_state["active"]:
+            return   # bot /kapat ile kapatılmışsa otomatik işlem yapma
+        et = get_us_eastern_now()
+        if et.weekday() >= 5 or is_market_holiday(et):
+            return
+        if et.hour * 60 + et.minute < 16 * 60:
+            return   # kapanış öncesi
+        bugun = et.strftime("%Y-%m-%d")
+        if _last_benchmark_date["date"] == bugun:
+            return
+        # Tarihi HEMEN işaretle: içeride hata olsa bile aynı gün tekrar
+        # tekrar denenip API kotası tüketilmesin.
+        _last_benchmark_date["date"] = bugun
+
+        try:
+            adet = int(os.environ.get("KIYAS_ADET", "15"))
+        except Exception:
+            adet = 15
+        adet = max(1, min(30, adet))
+
+        r = rastgele_kiyas_ornegi_al(adet=adet, tarih=et.date())
+        if r.get("hata"):
+            print(f"[DEBUG maybe_run_daily_benchmark] atlandı: {r['hata']}")
+            return
+        send_telegram(
+            f"🎲 <b>Günlük kıyas örneği alındı</b> — {r['tarih'].strftime('%d.%m.%Y')}\n"
+            f"Eklenen: {len(r['eklenen'])} hisse · Hariç tutulan: {r['haric']} sembol\n"
+            f"<i>Rastgele kıyas grubu, sinyallerin gerçekten değer üretip "
+            f"üretmediğini ölçmek için otomatik olarak toplanıyor.</i>"
+        )
+        print(f"[DEBUG maybe_run_daily_benchmark] {len(r['eklenen'])} kıyas satırı eklendi")
+    except Exception as e:
+        print(f"[DEBUG maybe_run_daily_benchmark] Hata: {e}")
+
+
 def handle_command(text, chat_id, thread_id=None):
     # Bu komut hangi konudan (topic) geldiyse, aynı fonksiyon içindeki TÜM
     # send_telegram(msg, chat_id) çağrıları otomatik olarak o konuya cevap
@@ -3385,91 +3519,29 @@ Kalan toplam: {_silindi['kalan']} satır
 Bunlar işlem günü olmayan bir tarihe (hafta sonu/tatil) kaydedilmiş, bu yüzden hiç ölçülemeyecek olan kıyas satırlarıydı.""", chat_id)
             return
 
-        # Tarih: hafta sonu/tatilde son geçerli işlem gününe sarılır
-        _tarih, _sarildi = son_islem_gunu()
-        _tarih_str = _tarih.strftime("%d.%m.%Y")
-
-        send_telegram(
-            f"🎲 Rastgele kıyas örneği alınıyor ({adet} hisse)..."
-            + (f"\n📅 Borsa bugün kapalı — kayıtlar son işlem günü olan "
-               f"<b>{_tarih_str}</b> tarihiyle açılacak." if _sarildi else ""),
-            chat_id)
-
-        havuz = get_raw_trading_pool()
-        if not havuz:
-            send_telegram("❌ Havuz alınamadı, kıyas örneği oluşturulamadı.", chat_id)
+        r = rastgele_kiyas_ornegi_al(adet=adet)
+        if r.get("hata"):
+            send_telegram(f"❌ Kıyas örneği oluşturulamadı: {r['hata']}", chat_id)
             return
-
-        # BAĞIMSIZLIK: o tarihte zaten GERÇEK sinyal üretmiş semboller
-        # havuzdan çıkarılır. Aksi halde aynı hisse aynı fiyatla iki grupta
-        # da yer alır, sonuçlar birebir aynı çıkar ve kıyas "fark yok"
-        # yönüne çekilerek sistemi haksız yere iyi gösterir.
-        _haric = set()
-        try:
-            _ws_k = _get_performance_worksheet()
-            if _ws_k is not None:
-                for _r in _ws_k.get_all_values()[1:]:
-                    if len(_r) >= 3 and (_r[0] or "").strip() == _tarih_str \
-                            and (_r[2] or "").strip() != "Rastgele (Kıyas)":
-                        _haric.add((_r[1] or "").strip())
-        except Exception as e:
-            print(f"[DEBUG /kiyas] hariç listesi okunamadı: {e}")
-
-        uygun_havuz = [h for h in havuz if h not in _haric]
-        if not uygun_havuz:
+        _tarih_str = r["tarih"].strftime("%d.%m.%Y")
+        if r["sarildi"]:
             send_telegram(
-                f"❌ {_tarih_str} tarihinde havuzdaki tüm semboller zaten sinyal üretmiş. "
-                "Bağımsız bir kıyas örneği oluşturulamıyor.", chat_id)
-            return
-        secilenler = random.sample(uygun_havuz, min(adet, len(uygun_havuz)))
-        eklenen, atlanan = [], []
-        for tk in secilenler:
-            try:
-                df_k = td_get_ohlcv(tk, outputsize=30)
-                if df_k is None or len(df_k) == 0:
-                    atlanan.append(tk)
-                    continue
-                fiyat = float(df_k["Close"].iloc[-1])
-                hacim = float(df_k["Volume"].iloc[-1]) * fiyat
-                meta_k = {
-                    "puan": "—",
-                    "hacim_m": round(hacim / 1_000_000, 2),
-                    "atr_pct": "",
-                    "kaynak": last_ohlcv_source.get("source", ""),
-                }
-                if append_performance_row(tk, fiyat, "Rastgele (Kıyas)", meta_k,
-                                          tarih_override=_tarih):
-                    eklenen.append(f"{tk} ${fiyat:.2f}")
-                else:
-                    atlanan.append(tk)
-            except Exception as e:
-                print(f"[DEBUG /kiyas] {tk}: {e}")
-                atlanan.append(tk)
-        # Yeni satırlar tablonun altına yazıldı; tarih sıralaması (en yeni
-        # üstte) bozulmasın diye hemen yeniden diziyoruz. Aksi halde 24.07
-        # satırları en yeni tarih olmasına rağmen en altta kalıyordu.
-        _sirala_notu = ""
-        if eklenen:
-            try:
-                resort_performance_sheet()
-                _sirala_notu = "\n🔃 Tablo yeniden sıralandı (en yeni tarih üstte)."
-            except Exception as e:
-                print(f"[DEBUG /kiyas] resort hatası: {e}")
-                _sirala_notu = "\n⚠️ Sıralama yenilenemedi; /performans komutu düzeltecek."
-
+                f"📅 Borsa bugün kapalı — kayıtlar son işlem günü olan "
+                f"<b>{_tarih_str}</b> tarihiyle açıldı.", chat_id)
         send_telegram(f"""🎲 <b>RASTGELE KIYAS ÖRNEĞİ</b>
 ──────────────────────────
 📅 Kayıt tarihi: {_tarih_str}
-🚫 Sinyal ürettiği için hariç tutulan: {len(_haric)} sembol
-✅ Tabloya eklenen: {len(eklenen)}
-{chr(10).join('• ' + e for e in eklenen) if eklenen else '—'}
-{('⏭️ Atlanan: ' + ', '.join(atlanan)) if atlanan else ''}{_sirala_notu}
+🚫 Sinyal ürettiği için hariç tutulan: {r['haric']} sembol
+✅ Tabloya eklenen: {len(r['eklenen'])}
+{chr(10).join('• ' + e for e in r['eklenen']) if r['eklenen'] else '—'}
+{('⏭️ Atlanan: ' + ', '.join(r['atlanan'])) if r['atlanan'] else ''}
+{'🔃 Tablo yeniden sıralandı (en yeni tarih üstte).' if r['eklenen'] else ''}
 ──────────────────────────
 Bu satırlar "Rastgele (Kıyas)" sinyal tipiyle kaydedildi ve gerçek sinyallerle <b>aynı kurallarla</b> 5 gün takip edilecek.
 
 /istatistik raporundaki "Sinyal Tipine Göre" bölümünde karşılaştırmalı olarak görünecek.
 
-⚠️ Anlamlı bir kıyas için birkaç hafta boyunca düzenli örnek almak gerekir (tek seferlik 10 hisse yeterli değildir).""", chat_id)
+ℹ️ Bu örnek her işlem günü kapanıştan sonra <b>otomatik</b> olarak da alınıyor — elle çalıştırmak zorunda değilsin.""", chat_id)
         return
 
     if any(t.startswith(x) for x in ['/istatistik','/istatistikler','/stats','/analiz-rapor']):
@@ -3771,6 +3843,7 @@ https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit
 ──────────────────────────
 🤖 Bot Durumu: {"✅ Açık" if bot_manual_state["active"] else "⛔ Manuel Kapalı"}
 💧 Likidite Filtresi: {f"✅ Açık (min ${MIN_PRICE:.2f} / ${MIN_DOLLAR_VOL_M:.1f}M)" if LIKIDITE_FILTRESI_AKTIF else "⛔ Kapalı"}
+🎲 Otomatik Kıyas: {"⛔ Kapalı" if os.environ.get("KIYAS_OTOMATIK", "1") == "0" else f"✅ Açık (günlük {os.environ.get('KIYAS_ADET', '15')} hisse, kapanış sonrası)"}
 ──────────────────────────
 Detay için /yardim veya /help""", chat_id)
         return
@@ -3798,8 +3871,10 @@ Her sinyal, kendi giriş fiyatıyla tabloya ayrı bir satır olarak yazılır ve
    (eş değer: /stats, /istatistikler, /analiz-rapor)
    Sinyal tipine ve fiyat aralığına göre başarı oranı, hedefin hangi günde tuttuğu, ortalama düşüş ve üç zarar kes eşiğinin (-%3 / -%5 / -%10) karşılaştırması.
 
-/kiyas [adet] — Rastgele kıyas örneği al
+/kiyas [adet] — Rastgele kıyas örneği al (ELLE)
    (eş değer: /benchmark, /rastgele — varsayılan 10, en fazla 30)
+   ℹ️ Bu örnek her işlem günü kapanıştan sonra OTOMATİK olarak alınır; elle çalıştırmak zorunlu değildir. Otomatik toplama giriş fiyatı olarak günün gerçek kapanışını kullandığı için daha tutarlıdır.
+   Kapatmak/ayarlamak için Railway ortam değişkenleri: KIYAS_OTOMATIK=0, KIYAS_ADET=15
    Hafta sonu/tatilde çalıştırılırsa kayıtları son işlem günü tarihiyle açar. O tarihte zaten sinyal üretmiş semboller hariç tutulur (iki grubun bağımsız kalması için).
 /kiyas sil — İşlem günü olmayan tarihe kaydedilmiş, ölçülemez kıyas satırlarını siler
    Havuzdan rastgele hisseleri sinyal üretmeden tabloya işler. Sinyallerin rastgele seçimden daha iyi olup olmadığını ölçmenin tek yolu budur.
@@ -4605,6 +4680,9 @@ def auto_scan_loop():
 
     while True:
         try:
+            # Önce kıyas örneği (yeni satırları ekler), sonra performans
+            # güncellemesi — böylece aynı turda yeni satırlar da dikkate alınır.
+            maybe_run_daily_benchmark()
             maybe_run_daily_performance_update()
 
             if is_bot_active():
