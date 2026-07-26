@@ -544,12 +544,52 @@ def get_ohlcv_source_label():
     else:
         return "📡 Kaynak: Veri alınamadı ❌"
 
-def td_get_ohlcv(symbol, outputsize=210):
+# GÜNLÜK OHLCV ÖNBELLEĞİ
+# Her sembolün geçmişi günde YALNIZCA BİR KEZ çekilir; aynı gün içindeki
+# tüm taramalar ve performans hesapları bu kopyayı kullanır.
+#
+# Neden gerekli: eskiden her tarama her sembol için 150-300 barlık geçmişi
+# baştan çekiyordu. Bu hem TwelveData'nın ücretsiz günlük istek bütçesini
+# (~800) saniyeler içinde tüketiyor hem de aynı sembol için gün içinde
+# FARKLI kaynaklardan (stockanalysis / TwelveData) veri gelmesine yol
+# açıyordu. İki kaynağın bölünme düzeltmesi farklı olduğu için bu, ölçümde
+# sahte dev düşüşler üretiyordu — tespit edilen 51 anormal satırın kökü bu.
+#
+# Önbellek ayrıca KAYNAK TUTARLILIĞI sağlar: bir sembol için gün içinde
+# hangi kaynak kullanıldıysa, o gün boyunca aynı kaynak kullanılır.
+#
+# Sınır: süreç yeniden başlarsa (redeploy) önbellek sıfırlanır. Railway
+# Hobby planında süreç sürekli ayakta olduğu için bu pratikte gün içinde
+# birkaç kezden fazla olmaz.
+_ohlcv_daily_cache = {}   # symbol -> {"date": date, "df": df, "source": str, "rows": int}
+
+
+def _ohlcv_cache_gecerli(symbol, outputsize):
+    """Önbellekteki kopya bugüne ait ve yeterince uzunsa onu döndürür."""
+    kayit = _ohlcv_daily_cache.get(symbol)
+    if not kayit:
+        return None
+    if kayit["date"] != get_us_eastern_now().date():
+        return None
+    if kayit["rows"] < min(outputsize, 150):
+        return None   # daha uzun geçmiş isteniyor, yeniden çekilmeli
+    last_ohlcv_source["source"] = kayit["source"]
+    return kayit["df"]
+
+
+def td_get_ohlcv(symbol, outputsize=210, use_cache=True):
+    if use_cache:
+        onbellek = _ohlcv_cache_gecerli(symbol, outputsize)
+        if onbellek is not None:
+            return onbellek
+
     # 1. Önce ücretsiz kaynak: stockanalysis.com /history/
     df = scrape_stockanalysis_history(symbol, min_rows=min(outputsize, 150))
     if df is not None and len(df) >= 20:
         last_ohlcv_source["source"] = "stockanalysis"
-        print(f"[DEBUG td_get_ohlcv] {symbol}: stockanalysis kullanıldı, {len(df)} satır")
+        _ohlcv_daily_cache[symbol] = {"date": get_us_eastern_now().date(), "df": df,
+                                      "source": "stockanalysis", "rows": len(df)}
+        print(f"[DEBUG td_get_ohlcv] {symbol}: stockanalysis kullanıldı, {len(df)} satır (önbelleğe alındı)")
         return df
 
     print(f"[DEBUG td_get_ohlcv] {symbol}: stockanalysis başarısız, Twelve Data deneniyor")
@@ -573,7 +613,9 @@ def td_get_ohlcv(symbol, outputsize=210):
         for col in ["Open","High","Low","Close","Volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         last_ohlcv_source["source"] = "twelvedata"
-        print(f"[DEBUG td_get_ohlcv] {symbol}: Twelve Data kullanıldı, {len(df)} satır")
+        _ohlcv_daily_cache[symbol] = {"date": get_us_eastern_now().date(), "df": df,
+                                      "source": "twelvedata", "rows": len(df)}
+        print(f"[DEBUG td_get_ohlcv] {symbol}: Twelve Data kullanıldı, {len(df)} satır (önbelleğe alındı)")
         return df
     except:
         last_ohlcv_source["source"] = "none"
@@ -3035,6 +3077,61 @@ def handle_command(text, chat_id, thread_id=None):
     # "/temizle" önizleme gösterir, "/temizle onayla" gerçekten siler.
     # İSTATİSTİK — performans tablosunu analiz eder, sistemin nerede
     # gerçekten işe yaradığını gösterir.
+    # RASTGELE KIYAS ÖLÇÜTÜ (benchmark)
+    # Aynı havuzdan rastgele seçilmiş hisseleri, sinyal üretmeden, aynı
+    # kurallarla tabloya işler. Sistemin gerçek değeri ancak buna karşı
+    # ölçülerek anlaşılır: oynak bir mikro-hissenin 5 gün içinde %5
+    # yükselmesi zaten yüksek olasılıktır. Sinyalin başarı oranı bu
+    # rastgele orandan belirgin şekilde yüksek DEĞİLSE, sistem değer
+    # üretmiyor demektir.
+    if any(t.startswith(x) for x in ['/kiyas','/kıyas','/benchmark','/rastgele']):
+        parcalar = t.split()
+        adet = 10
+        for pc in parcalar[1:]:
+            if pc.isdigit():
+                adet = max(1, min(30, int(pc)))
+                break
+        send_telegram(f"🎲 Rastgele kıyas örneği alınıyor ({adet} hisse)...", chat_id)
+        havuz = get_raw_trading_pool()
+        if not havuz:
+            send_telegram("❌ Havuz alınamadı, kıyas örneği oluşturulamadı.", chat_id)
+            return
+        secilenler = random.sample(havuz, min(adet, len(havuz)))
+        eklenen, atlanan = [], []
+        for tk in secilenler:
+            try:
+                df_k = td_get_ohlcv(tk, outputsize=30)
+                if df_k is None or len(df_k) == 0:
+                    atlanan.append(tk)
+                    continue
+                fiyat = float(df_k["Close"].iloc[-1])
+                hacim = float(df_k["Volume"].iloc[-1]) * fiyat
+                meta_k = {
+                    "puan": "—",
+                    "hacim_m": round(hacim / 1_000_000, 2),
+                    "atr_pct": "",
+                    "kaynak": last_ohlcv_source.get("source", ""),
+                }
+                if append_performance_row(tk, fiyat, "Rastgele (Kıyas)", meta_k):
+                    eklenen.append(f"{tk} ${fiyat:.2f}")
+                else:
+                    atlanan.append(tk)
+            except Exception as e:
+                print(f"[DEBUG /kiyas] {tk}: {e}")
+                atlanan.append(tk)
+        send_telegram(f"""🎲 <b>RASTGELE KIYAS ÖRNEĞİ</b>
+──────────────────────────
+✅ Tabloya eklenen: {len(eklenen)}
+{chr(10).join('• ' + e for e in eklenen) if eklenen else '—'}
+{('⏭️ Atlanan: ' + ', '.join(atlanan)) if atlanan else ''}
+──────────────────────────
+Bu satırlar "Rastgele (Kıyas)" sinyal tipiyle kaydedildi ve gerçek sinyallerle <b>aynı kurallarla</b> 5 gün takip edilecek.
+
+/istatistik raporundaki "Sinyal Tipine Göre" bölümünde karşılaştırmalı olarak görünecek.
+
+⚠️ Anlamlı bir kıyas için birkaç hafta boyunca düzenli örnek almak gerekir (tek seferlik 10 hisse yeterli değildir).""", chat_id)
+        return
+
     if any(t.startswith(x) for x in ['/istatistik','/istatistikler','/stats','/analiz-rapor']):
         ws_ist = _get_performance_worksheet()
         if ws_ist is None:
@@ -3334,6 +3431,10 @@ Her sinyal, kendi giriş fiyatıyla tabloya ayrı bir satır olarak yazılır ve
    (eş değer: /stats, /istatistikler, /analiz-rapor)
    Sinyal tipine ve fiyat aralığına göre başarı oranı, hedefin hangi günde tuttuğu, ortalama düşüş ve üç zarar kes eşiğinin (-%3 / -%5 / -%10) karşılaştırması.
 
+/kiyas [adet] — Rastgele kıyas örneği al
+   (eş değer: /benchmark, /rastgele — varsayılan 10, en fazla 30)
+   Havuzdan rastgele hisseleri sinyal üretmeden tabloya işler. Sinyallerin rastgele seçimden daha iyi olup olmadığını ölçmenin tek yolu budur.
+
 /temizle — Tekrarlanan satırları sil
    (eş değer: /tekrarsil, /dedup)
    Aynı Tarih + Sembol + Sinyal Tipi olan satırlardan sadece en dolu olanı bırakır. İlk yazımda ÖNİZLEME gösterir; gerçekten silmek için <code>/temizle onayla</code> yazılmalıdır. Geri alınamaz.
@@ -3429,6 +3530,10 @@ Every signal gets its own row with its own entry price and is tracked for 5 trad
 /istatistik — Success analysis
    (aliases: /stats, /istatistikler)
    Win rate by signal type and price band, which day the target was hit, average drawdown, and a comparison of three stop-loss thresholds (-3% / -5% / -10%).
+
+/kiyas [n] — Take a random benchmark sample
+   (aliases: /benchmark, /rastgele — default 10, max 30)
+   Logs random pool symbols without generating signals, measured by identical rules.
 
 /temizle — Remove duplicate rows
    (aliases: /tekrarsil, /dedup)
