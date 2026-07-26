@@ -1030,6 +1030,105 @@ def update_daily_performance():
     return stats
 
 
+def cleanup_duplicate_rows(dry_run=True):
+    """
+    Aynı Tarih + Sembol + Sinyal Tipi üçlüsüne sahip TEKRARLANAN satırları
+    temizler; her gruptan yalnızca bir satır bırakır.
+
+    Bu satırlar, kalıcı dedup mekanizması eklenmeden önce oluşmuş geçmiş
+    kalıntılarıdır (ör. 13.07'de NVDA 15 kez, 14.07'de FTRK 15 kez). Aynı
+    sinyal defalarca sayıldığı için başarı oranı istatistikleri çarpık
+    çıkıyor — bu yüzden temizlenmeleri gerekiyor.
+
+    Hangi satır korunur: gruptaki EN DOLU satır (en çok hücresi yazılmış
+    olan). Böylece Gün değerleri ve Hedef işareti dolu olan sürüm kalır,
+    boş kopyalar atılır.
+
+    dry_run=True ise hiçbir şey yazılmaz, sadece ne olacağı raporlanır.
+    Dönüş: {"toplam", "silinecek", "kalan", "gruplar", "hata"}
+    """
+    rapor = {"toplam": 0, "silinecek": 0, "kalan": 0, "gruplar": 0, "hata": None}
+    ws = _get_performance_worksheet()
+    if ws is None:
+        rapor["hata"] = "Google Sheets bağlantısı kurulamadı"
+        return rapor
+    try:
+        all_rows = ws.get_all_values()
+    except Exception as e:
+        rapor["hata"] = f"Sheet okunamadı: {e}"
+        return rapor
+    if len(all_rows) <= 1:
+        rapor["hata"] = "Tabloda başlık dışında satır yok"
+        return rapor
+
+    width = len(PERFORMANCE_SHEET_HEADER)
+    veri = []
+    for row in all_rows[1:]:
+        padded = (row + [""] * width)[:width]
+        if not any((c or "").strip() for c in padded):
+            continue  # boş ayraç satırı, atla
+        veri.append(padded)
+
+    rapor["toplam"] = len(veri)
+
+    # Grupla: (tarih, sembol, sinyal tipi) -> en dolu satır
+    en_iyi = {}
+    sira = []
+    for row in veri:
+        key = ((row[0] or "").strip(), (row[1] or "").strip(), (row[2] or "").strip())
+        doluluk = sum(1 for c in row if (c or "").strip())
+        if key not in en_iyi:
+            en_iyi[key] = (doluluk, row)
+            sira.append(key)
+        else:
+            rapor["silinecek"] += 1
+            if doluluk > en_iyi[key][0]:
+                en_iyi[key] = (doluluk, row)
+
+    rapor["gruplar"] = len(en_iyi)
+    rapor["kalan"] = len(en_iyi)
+
+    if dry_run or rapor["silinecek"] == 0:
+        return rapor
+
+    temiz = [en_iyi[k][1] for k in sira]
+
+    # Tarih TERSTEN (en yeni üstte), tarih içinde sembol alfabetik
+    def _pt(s):
+        try:
+            return datetime.strptime((s or "").strip(), "%d.%m.%Y")
+        except Exception:
+            return datetime.min
+    temiz.sort(key=lambda r: (r[1] or ""))
+    temiz.sort(key=lambda r: _pt(r[0]), reverse=True)
+
+    # Günler arasına boş ayraç satırı koy
+    final_rows = []
+    son_tarih = None
+    for row in temiz:
+        if son_tarih is not None and row[0] != son_tarih:
+            final_rows.append([""] * width)
+        final_rows.append(row)
+        son_tarih = row[0]
+
+    son_kolon = gspread.utils.rowcol_to_a1(1, width)[0]
+    try:
+        _sheets_call_with_retry(
+            lambda: ws.batch_clear([f"A2:{son_kolon}{len(all_rows) + 5}"])
+        )
+        _sheets_call_with_retry(
+            lambda: ws.update(f"A2:{son_kolon}{len(final_rows) + 1}", final_rows,
+                              value_input_option="USER_ENTERED")
+        )
+        _last_date_cache["date"] = None  # önbelleği tazele
+        print(f"[DEBUG cleanup_duplicate_rows] {rapor['silinecek']} tekrar satırı silindi, "
+              f"{rapor['kalan']} satır kaldı.")
+    except Exception as e:
+        print(f"[DEBUG cleanup_duplicate_rows] Yazma hatası: {e}")
+        rapor["hata"] = f"Yazma hatası: {e}"
+    return rapor
+
+
 def resort_performance_sheet():
     """
     Performans tablosunu ANA sırada tarihe (kronolojik), her tarihin
@@ -2852,6 +2951,48 @@ def handle_command(text, chat_id, thread_id=None):
 
     # PERFORMANS TABLOSUNU ELLE GÜNCELLE — kapanışı beklemeden tetiklemek
     # ve sorun olduğunda nedenini görebilmek için tanı bilgisi de döner.
+    # TEKRARLANAN SATIRLARI TEMİZLE — geri alınamaz olduğu için iki aşamalı:
+    # "/temizle" önizleme gösterir, "/temizle onayla" gerçekten siler.
+    if any(t.startswith(x) for x in ['/temizle','/tekrarsil','/dedup']):
+        onayli = "onayla" in t or "onay" in t
+        try:
+            r = cleanup_duplicate_rows(dry_run=not onayli)
+        except Exception as e:
+            send_telegram(f"❌ Temizlik sırasında hata: {e}", chat_id)
+            return
+        if r.get("hata"):
+            send_telegram(f"❌ <b>Temizlik yapılamadı</b>\n\nSebep: {r['hata']}", chat_id)
+            return
+        if r["silinecek"] == 0:
+            send_telegram(f"""✨ <b>TEMİZLİK GEREKMİYOR</b>
+──────────────────────────
+Tabloda tekrarlanan satır bulunamadı.
+📋 Toplam satır: {r['toplam']}""", chat_id)
+            return
+        if not onayli:
+            send_telegram(f"""🧹 <b>TEMİZLİK ÖNİZLEMESİ</b>
+──────────────────────────
+📋 Mevcut satır: {r['toplam']}
+🗑️ Silinecek tekrar satırı: {r['silinecek']}
+✅ Kalacak satır: {r['kalan']}
+──────────────────────────
+Aynı Tarih + Sembol + Sinyal Tipi olan satırlardan sadece EN DOLU olanı korunur.
+
+⚠️ <b>Bu işlem geri alınamaz.</b>
+Onaylamak için: <code>/temizle onayla</code>""", chat_id)
+            return
+        try:
+            resort_performance_sheet()
+        except Exception as e:
+            print(f"[DEBUG /temizle] resort hatası: {e}")
+        send_telegram(f"""✅ <b>TEMİZLİK TAMAMLANDI</b>
+──────────────────────────
+🗑️ Silinen tekrar satırı: {r['silinecek']}
+📋 Kalan satır: {r['kalan']}
+──────────────────────────
+Tablo yeniden sıralandı. İstatistikler artık doğru sayım üzerinden hesaplanacak.""", chat_id)
+        return
+
     if any(t.startswith(x) for x in ['/performans','/performance','/tablo','/guncelle']):
         send_telegram("⏳ Performans tablosu güncelleniyor, bu işlem birkaç dakika sürebilir...", chat_id)
         try:
@@ -2918,6 +3059,7 @@ Detay için /yardim veya /help""", chat_id)
 /yardim — Bu liste (eş değer: /yardım, /komutlar, /komut)
 /help — İngilizce komut listesi
 /performans — Performans tablosunu şimdi güncelle (eş değer: /tablo, /guncelle)
+/temizle — Tabloda tekrarlanan satırları temizle (önce önizleme gösterir)
 
 🔌 <b>BOT AÇ/KAPAT</b> (sadece otomatik taramayı durdurur, manuel komutlar her zaman çalışır)
 /ac — Botu aç (eş değer: /acik, /open, /basla, /turnon, /aktif)
