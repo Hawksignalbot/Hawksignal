@@ -839,7 +839,7 @@ def append_performance_row(symbol, entry_price, signal_type):
         print(f"[DEBUG append_performance_row] Hata: {e}")
         return False
 
-def update_daily_performance():
+def update_daily_performance(force=False):
     """
     Her satırın GERÇEK giriş tarihinden itibaren gelen 5 işlem gününü
     tarihsel OHLCV verisiyle ölçer ve tabloyu doldurur.
@@ -919,10 +919,13 @@ def update_daily_performance():
 
             stats["satir"] += 1
 
+            # force=True ise tamamlanmış satırlar da baştan hesaplanır
+            # (ör. ölçüm mantığı veya veri bütünlüğü kontrolü değiştiğinde
+            # geçmişin yeni kurallara göre yeniden değerlendirilmesi için).
             # Yeni biçimde tamamlanmış satır: Sonuç VE En Düşük dolu.
             # (Eski satırlarda En Düşük boş olduğu için onlar yeniden
             # işlenip yeni sütunlar geriye dönük doldurulur.)
-            if sonuc and en_dusuk_mevcut:
+            if sonuc and en_dusuk_mevcut and not force:
                 stats["tamam"] += 1
                 continue
 
@@ -1020,7 +1023,7 @@ def update_daily_performance():
             # Gün1-5 Max sütunlarını doldur (hedefin tutulduğu güne kadar)
             son_gun = hit_gun if hit_gun is not None else n_gun - 1
             for k in range(min(son_gun + 1, 5)):
-                if gun_values[k]:
+                if gun_values[k] and not force:
                     continue
                 updates.append((i, 5 + k, round(highs[k], 2)))
                 dokundu = True
@@ -1037,7 +1040,7 @@ def update_daily_performance():
             if yeni_sonuc == "🛑":
                 stop_cells.append(gspread.utils.rowcol_to_a1(i, 10))
 
-            if not en_dusuk_mevcut:
+            if not en_dusuk_mevcut or force:
                 updates.append((i, 11, round(en_dusuk, 2)))
                 updates.append((i, 12, f"%{max_dusus_pct:.1f}"))
                 dokundu = True
@@ -3147,9 +3150,14 @@ Tablo yeniden sıralandı. İstatistikler artık doğru sayım üzerinden hesapl
         return
 
     if any(t.startswith(x) for x in ['/performans','/performance','/tablo','/guncelle']):
-        send_telegram("⏳ Performans tablosu güncelleniyor, bu işlem birkaç dakika sürebilir...", chat_id)
+        zorla = any(k in t for k in ('yenile', 'force', 'hepsi', 'bastan'))
+        send_telegram(
+            ("♻️ TÜM satırlar baştan hesaplanıyor (yenileme modu). Bu işlem birkaç dakika sürebilir..."
+             if zorla else
+             "⏳ Performans tablosu güncelleniyor, bu işlem birkaç dakika sürebilir..."),
+            chat_id)
         try:
-            s = update_daily_performance()
+            s = update_daily_performance(force=zorla)
         except Exception as e:
             send_telegram(f"❌ Güncelleme sırasında hata: {e}", chat_id)
             return
@@ -3219,6 +3227,8 @@ Her sinyal, kendi giriş fiyatıyla tabloya ayrı bir satır olarak yazılır ve
 
 /performans — Tabloyu şimdi güncelle
    (eş değer: /tablo, /guncelle, /performance)
+/performans yenile — TÜM satırları baştan hesapla
+   (ölçüm kuralları değiştiğinde geçmişi yeni kurallara göre yeniden değerlendirir)
    Kapanışı beklemeden Gün1-5, En Düşük, Max Düşüş %, Tuttuğu Gün ve Zarar Kes sütunlarını doldurur. Bot bir süre kapalı kaldıysa atlanan günleri geriye dönük tamamlar. Sonunda tanı raporu ve tablonun bağlantısını verir.
 
 /istatistik — Sistem başarı analizi
@@ -3313,6 +3323,8 @@ Every signal gets its own row with its own entry price and is tracked for 5 trad
 
 /performans — Update the table now
    (aliases: /performance, /tablo, /guncelle)
+/performans yenile — Recompute ALL rows from scratch
+   (re-evaluates history when measurement rules change)
    Fills Day1-5, Lowest, Max Drawdown %, Hit Day and Stop-Loss columns without waiting for market close. Backfills days missed while the bot was offline. Returns a diagnostic report and the sheet link.
 
 /istatistik — Success analysis
