@@ -870,12 +870,14 @@ def update_daily_performance():
     """
     STOP_ESIKLERI = [3.0, 5.0, 10.0]   # yüzde
     STOP_REFERANS = 5.0                # Sonuç sütununda kullanılan eşik
-    ANOMALI_ORANI = 0.50               # günden güne %50+ sıçrama = şüpheli
+    ANOMALI_ORANI = 0.30               # günden güne %30+ sıçrama = şüpheli
+    GIRIS_TOLERANS = 0.05              # giriş fiyatı, giriş günü aralığından
+                                       # en fazla %5 sapabilir
 
     stats = {"satir": 0, "islenen": 0, "hucre": 0, "veri_yok": 0,
              "tarih_yok": 0, "tamam": 0, "fiyat_okunamadi": 0,
              "tarih_bozuk": 0, "gun_beklemede": 0, "dokunulmadi": 0,
-             "anomali": 0, "hata": None}
+             "anomali": 0, "giris_tutarsiz": 0, "hata": None}
 
     ws = _get_performance_worksheet()
     if ws is None:
@@ -943,6 +945,19 @@ def update_daily_performance():
             if not matches:
                 stats["tarih_yok"] += 1
                 continue
+            # GİRİŞ FİYATI TUTARLILIK KONTROLÜ
+            # Giriş fiyatı, kendi giriş gününün Düşük-Yüksek aralığının
+            # içinde olmalıdır. Dışındaysa giriş fiyatı ile tarihsel seri
+            # AYNI ÖLÇEKTE DEĞİL demektir (bölünme düzeltmesi farkı ya da
+            # iki farklı veri kaynağının karışması). Böyle satırlarda
+            # hesaplanan düşüş/başarı tamamen yanıltıcı olur, bu yüzden
+            # ⚠️ ile işaretlenip istatistikten çıkarılırlar.
+            _g = df.iloc[matches[0]]
+            g_low, g_high = float(_g["Low"]), float(_g["High"])
+            giris_tutarsiz = not (g_low * (1 - GIRIS_TOLERANS)
+                                  <= entry_price
+                                  <= g_high * (1 + GIRIS_TOLERANS))
+
             following = df.iloc[matches[0] + 1: matches[0] + 6].reset_index(drop=True)
             n_gun = len(following)
             if n_gun == 0:
@@ -967,10 +982,14 @@ def update_daily_performance():
 
             # Anormallik: günden güne %50+ sıçrama (bölünme şüphesi)
             seri = [entry_price] + highs
-            anormal = any(
+            anormal = giris_tutarsiz or any(
                 seri[k] > 0 and abs(seri[k + 1] - seri[k]) / seri[k] > ANOMALI_ORANI
                 for k in range(len(seri) - 1)
             )
+            if giris_tutarsiz:
+                stats["giris_tutarsiz"] += 1
+                print(f"[DEBUG update_daily_performance] {symbol} {tarih_str}: giriş {entry_price} "
+                      f"giriş günü aralığı [{g_low}, {g_high}] dışında -> ⚠️")
 
             en_dusuk = min(lows)
             max_dusus_pct = (en_dusuk - entry_price) / entry_price * 100.0
@@ -3158,6 +3177,7 @@ Tablo yeniden sıralandı. İstatistikler artık doğru sayım üzerinden hesapl
 ⏳ Günü henüz gelmemiş (bekliyor): {s.get('gun_beklemede', 0)}
 ❓ Sebebi belirsiz (loglara bakılmalı): {s.get('dokunulmadi', 0)}
 ⚠️ Veri anormal (bölünme şüphesi): {s.get('anomali', 0)}
+🚩 Giriş fiyatı seriyle tutarsız: {s.get('giris_tutarsiz', 0)}
 ──────────────────────────
 Gün sütunları hâlâ boş kalıyorsa yukarıdaki uyarı satırları sebebi gösterir.
 ──────────────────────────
