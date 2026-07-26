@@ -3193,9 +3193,28 @@ Detay için /yardim veya /help""", chat_id)
 /liste — Havuz/tarama durumu (eş değer: /list)
 /yardim — Bu liste (eş değer: /yardım, /komutlar, /komut)
 /help — İngilizce komut listesi
-/performans — Performans tablosunu şimdi güncelle (eş değer: /tablo, /guncelle)
-/temizle — Tabloda tekrarlanan satırları temizle (önce önizleme gösterir)
-/istatistik — Sistem başarı analizi (eş değer: /stats)
+──────────────────────────
+📄 <b>GOOGLE DOKÜMAN (Performans Tablosu)</b>
+Her sinyal, kendi giriş fiyatıyla tabloya ayrı bir satır olarak yazılır ve 5 işlem günü boyunca takip edilir. Tablo tarihe göre TERSTEN sıralıdır — en yeni gün en üstte.
+
+/performans — Tabloyu şimdi güncelle
+   (eş değer: /tablo, /guncelle, /performance)
+   Kapanışı beklemeden Gün1-5, En Düşük, Max Düşüş %, Tuttuğu Gün ve Zarar Kes sütunlarını doldurur. Bot bir süre kapalı kaldıysa atlanan günleri geriye dönük tamamlar. Sonunda tanı raporu ve tablonun bağlantısını verir.
+
+/istatistik — Sistem başarı analizi
+   (eş değer: /stats, /istatistikler, /analiz-rapor)
+   Sinyal tipine ve fiyat aralığına göre başarı oranı, hedefin hangi günde tuttuğu, ortalama düşüş ve üç zarar kes eşiğinin (-%3 / -%5 / -%10) karşılaştırması.
+
+/temizle — Tekrarlanan satırları sil
+   (eş değer: /tekrarsil, /dedup)
+   Aynı Tarih + Sembol + Sinyal Tipi olan satırlardan sadece en dolu olanı bırakır. İlk yazımda ÖNİZLEME gösterir; gerçekten silmek için <code>/temizle onayla</code> yazılmalıdır. Geri alınamaz.
+
+<b>Sonuç sütunu:</b>
+✅ %5 hedef tuttu
+🛑 Zarar kes (-%5) hedeften önce tetiklendi
+⛔ 5 gün doldu, ne hedef ne zarar kes
+⚠️ Veri anormal (bölünme şüphesi) — istatistiğe katılmaz
+(boş) Takip penceresi hâlâ açık
 
 🔌 <b>BOT AÇ/KAPAT</b> (sadece otomatik taramayı durdurur, manuel komutlar her zaman çalışır)
 /ac — Botu aç (eş değer: /acik, /open, /basla, /turnon, /aktif)
@@ -3268,6 +3287,28 @@ haberler de otomatik olarak eklenir (kazanç, CEO, birleşme vb.)
 /list — Pool/scan status (alias: /liste)
 /help — This list
 /yardim — Turkish command list
+──────────────────────────
+📄 <b>GOOGLE SHEET (Performance Table)</b>
+Every signal gets its own row with its own entry price and is tracked for 5 trading days. The table is sorted newest-date-first.
+
+/performans — Update the table now
+   (aliases: /performance, /tablo, /guncelle)
+   Fills Day1-5, Lowest, Max Drawdown %, Hit Day and Stop-Loss columns without waiting for market close. Backfills days missed while the bot was offline. Returns a diagnostic report and the sheet link.
+
+/istatistik — Success analysis
+   (aliases: /stats, /istatistikler)
+   Win rate by signal type and price band, which day the target was hit, average drawdown, and a comparison of three stop-loss thresholds (-3% / -5% / -10%).
+
+/temizle — Remove duplicate rows
+   (aliases: /tekrarsil, /dedup)
+   Keeps only the most complete row per Date + Symbol + Signal Type. Shows a PREVIEW first; type <code>/temizle onayla</code> to actually delete. Not reversible.
+
+<b>Result column:</b>
+✅ 5% target hit
+🛑 Stop-loss (-5%) triggered before target
+⛔ 5 days elapsed, neither target nor stop
+⚠️ Anomalous data (possible split) — excluded from stats
+(blank) Tracking window still open
 
 🔌 <b>BOT ON/OFF</b> (only stops automatic scanning, manual commands always work)
 /ac — Turn bot on (aliases: /acik, /open, /basla, /turnon, /aktif)
