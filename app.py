@@ -3445,13 +3445,25 @@ Bunlar işlem günü olmayan bir tarihe (hafta sonu/tatil) kaydedilmiş, bu yüz
             except Exception as e:
                 print(f"[DEBUG /kiyas] {tk}: {e}")
                 atlanan.append(tk)
+        # Yeni satırlar tablonun altına yazıldı; tarih sıralaması (en yeni
+        # üstte) bozulmasın diye hemen yeniden diziyoruz. Aksi halde 24.07
+        # satırları en yeni tarih olmasına rağmen en altta kalıyordu.
+        _sirala_notu = ""
+        if eklenen:
+            try:
+                resort_performance_sheet()
+                _sirala_notu = "\n🔃 Tablo yeniden sıralandı (en yeni tarih üstte)."
+            except Exception as e:
+                print(f"[DEBUG /kiyas] resort hatası: {e}")
+                _sirala_notu = "\n⚠️ Sıralama yenilenemedi; /performans komutu düzeltecek."
+
         send_telegram(f"""🎲 <b>RASTGELE KIYAS ÖRNEĞİ</b>
 ──────────────────────────
 📅 Kayıt tarihi: {_tarih_str}
 🚫 Sinyal ürettiği için hariç tutulan: {len(_haric)} sembol
 ✅ Tabloya eklenen: {len(eklenen)}
 {chr(10).join('• ' + e for e in eklenen) if eklenen else '—'}
-{('⏭️ Atlanan: ' + ', '.join(atlanan)) if atlanan else ''}
+{('⏭️ Atlanan: ' + ', '.join(atlanan)) if atlanan else ''}{_sirala_notu}
 ──────────────────────────
 Bu satırlar "Rastgele (Kıyas)" sinyal tipiyle kaydedildi ve gerçek sinyallerle <b>aynı kurallarla</b> 5 gün takip edilecek.
 
