@@ -27,6 +27,24 @@ TD_API_KEY = os.environ.get("TD_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 GOOGLE_SHEETS_CREDENTIALS_JSON = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON")
+
+# LİKİDİTE FİLTRESİ (varsayılan KAPALI)
+# Ölçümler, düşük fiyatlı/düşük hacimli hisselerin hem daha kötü sonuç
+# verdiğini hem de alış-satış makası yüzünden gerçekte daha da kötü
+# olduğunu gösteriyor. Bu filtre havuzu daraltarak bunu test etmeyi sağlar.
+# Havuzu daraltmak sinyal sayısını doğrudan azalttığı için varsayılan
+# olarak kapalıdır; Railway'de ortam değişkeni ile açılır:
+#   MIN_PRICE=5        (dolar)
+#   MIN_DOLLAR_VOL_M=5 (milyon dolar günlük işlem hacmi)
+def _env_float(ad, varsayilan=0.0):
+    try:
+        return float(os.environ.get(ad, varsayilan))
+    except Exception:
+        return varsayilan
+
+MIN_PRICE = _env_float("MIN_PRICE", 0.0)
+MIN_DOLLAR_VOL_M = _env_float("MIN_DOLLAR_VOL_M", 0.0)
+LIKIDITE_FILTRESI_AKTIF = MIN_PRICE > 0 or MIN_DOLLAR_VOL_M > 0
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "12tBEKxu1tBMknB9A3EfpmXO8WVt2gpjbPA1mGqjJU6Q")
 
 # ===== 6 KANAL YAPISI =====
@@ -575,6 +593,32 @@ def _ohlcv_cache_gecerli(symbol, outputsize):
         return None   # daha uzun geçmiş isteniyor, yeniden çekilmeli
     last_ohlcv_source["source"] = kayit["source"]
     return kayit["df"]
+
+
+def likidite_uygun(df):
+    """
+    Likidite filtresi aktifse, sembolün fiyat ve dolar hacmi eşikleri
+    karşılıyor mu? Filtre kapalıysa her zaman True döner (davranış değişmez).
+
+    Dönüş: (uygun_mu, aciklama)
+    """
+    if not LIKIDITE_FILTRESI_AKTIF:
+        return True, ""
+    try:
+        if df is None or len(df) == 0:
+            return False, "veri yok"
+        fiyat = float(df["Close"].iloc[-1])
+        # Son 20 günün ortalama dolar hacmi (tek günün sıçraması yanıltmasın)
+        son = df.tail(20)
+        ort_dolar_hacim = float((son["Close"] * son["Volume"]).mean())
+        if MIN_PRICE > 0 and fiyat < MIN_PRICE:
+            return False, f"fiyat ${fiyat:.2f} < ${MIN_PRICE:.2f}"
+        if MIN_DOLLAR_VOL_M > 0 and ort_dolar_hacim < MIN_DOLLAR_VOL_M * 1_000_000:
+            return False, f"hacim ${ort_dolar_hacim/1_000_000:.1f}M < ${MIN_DOLLAR_VOL_M:.1f}M"
+        return True, ""
+    except Exception as e:
+        print(f"[DEBUG likidite_uygun] hata: {e}")
+        return True, ""   # şüphede kalırsak engellemeyiz
 
 
 def td_get_ohlcv(symbol, outputsize=210, use_cache=True):
@@ -2179,6 +2223,14 @@ def analyze_stock(symbol, df=None):
             print(f"[DEBUG analyze_stock] {symbol}: df is None (veri çekilemedi)")
             return None
 
+        # Likidite filtresi (varsayılan kapalı — sadece ortam değişkeni
+        # tanımlıysa devreye girer). Düşük fiyat/hacimli hisselerde makas
+        # maliyeti kazancı yediği için bu hisseler taramadan çıkarılabilir.
+        _uygun, _neden = likidite_uygun(df)
+        if not _uygun:
+            print(f"[DEBUG analyze_stock] {symbol}: likidite filtresi ({_neden}), atlandı")
+            return None
+
         data_days = len(df)
         if data_days < 20:
             print(f"[DEBUG analyze_stock] {symbol}: data_days={data_days} < 20, yetersiz veri (muhtemel yeni IPO)")
@@ -2523,6 +2575,11 @@ def early_warning_scan(symbol, df=None):
             df = td_get_ohlcv(symbol, outputsize=60)
         if df is None:
             print(f"[DEBUG early_warning_scan] {symbol}: df is None (veri çekilemedi)")
+            return None
+
+        _uygun, _neden = likidite_uygun(df)
+        if not _uygun:
+            print(f"[DEBUG early_warning_scan] {symbol}: likidite filtresi ({_neden}), atlandı")
             return None
         if len(df) < 30:
             print(f"[DEBUG early_warning_scan] {symbol}: len<30 (len={len(df)}), muhtemel yeni IPO")
@@ -3404,6 +3461,7 @@ https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit
 🔔 ALARMLAR | 💼 PORTFÖY
 ──────────────────────────
 🤖 Bot Durumu: {"✅ Açık" if bot_manual_state["active"] else "⛔ Manuel Kapalı"}
+💧 Likidite Filtresi: {f"✅ Açık (min ${MIN_PRICE:.2f} / ${MIN_DOLLAR_VOL_M:.1f}M)" if LIKIDITE_FILTRESI_AKTIF else "⛔ Kapalı"}
 ──────────────────────────
 Detay için /yardim veya /help""", chat_id)
         return
