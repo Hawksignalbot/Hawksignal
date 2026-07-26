@@ -640,6 +640,33 @@ def _get_tarih_format(et_dt):
         "textFormat": {"bold": True, "foregroundColor": {"red": r, "green": g, "blue": b}}
     }
 
+def _sheets_call_with_retry(fn, attempts=4, base_wait=35):
+    """
+    Google Sheets çağrısını kota (429) hatasına karşı dayanıklı hale getirir.
+
+    Sheets'in "dakikada yazma isteği" kotası aşıldığında API 429 döner.
+    Kota dakikalık pencerelerle sıfırlandığı için, hatayı kullanıcıya
+    yansıtmadan önce bekleyip tekrar deniyoruz. 429 dışındaki hatalar
+    (izin, geçersiz aralık vb.) beklemeye değmez, hemen yukarı fırlatılır.
+    """
+    last_err = None
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            msg = str(e)
+            is_quota = "429" in msg or "Quota exceeded" in msg or "RATE_LIMIT" in msg.upper()
+            if not is_quota:
+                raise
+            last_err = e
+            if attempt == attempts - 1:
+                break
+            wait = base_wait * (attempt + 1)
+            print(f"[DEBUG _sheets_call_with_retry] Kota aşıldı, {wait} sn beklenip tekrar denenecek "
+                  f"(deneme {attempt + 1}/{attempts})")
+            time.sleep(wait)
+    raise last_err
+
 def _parse_sheet_number(val):
     """
     Google Sheets'ten metin olarak gelen sayıyı güvenli şekilde float'a çevirir.
@@ -946,11 +973,19 @@ def update_daily_performance():
     try:
         if updates:
             cell_updates = [{"range": gspread.utils.rowcol_to_a1(r, c), "values": [[v]]} for r, c, v in updates]
-            ws.batch_update(cell_updates, value_input_option="USER_ENTERED")
+            _sheets_call_with_retry(
+                lambda: ws.batch_update(cell_updates, value_input_option="USER_ENTERED")
+            )
+        # Biçimlendirmeyi TEK toplu istekte gönderiyoruz. Eskiden her hücre
+        # için ayrı ws.format() çağrılıyordu; bu yüzlerce API isteği demekti
+        # ve Google'ın "dakikada yazma isteği" kotasını (429) aşıyordu.
+        format_requests = []
         for a1 in hit_cells:
-            ws.format(a1, _FMT_GUN_HEDEF_TUTTU)
+            format_requests.append({"range": a1, "format": _FMT_GUN_HEDEF_TUTTU})
         for a1 in after_cells:
-            ws.format(a1, _FMT_GUN_HEDEF_SONRASI)
+            format_requests.append({"range": a1, "format": _FMT_GUN_HEDEF_SONRASI})
+        if format_requests:
+            _sheets_call_with_retry(lambda: ws.batch_format(format_requests))
         print(f"[DEBUG update_daily_performance] {len(updates)} hücre güncellendi "
               f"({len(hit_cells)} hedef tuttu, {len(after_cells)} hücre yeşil boyandı)")
     except Exception as e:
@@ -1018,8 +1053,10 @@ def resort_performance_sheet():
 
     try:
         # Mevcut veri alanını temizle, sıralı hâliyle yeniden yaz
-        ws.batch_clear([f"A2:J{len(all_rows) + 5}"])
-        ws.update(f"A2:J{len(final_rows) + 1}", final_rows, value_input_option="USER_ENTERED")
+        _sheets_call_with_retry(lambda: ws.batch_clear([f"A2:J{len(all_rows) + 5}"]))
+        _sheets_call_with_retry(
+            lambda: ws.update(f"A2:J{len(final_rows) + 1}", final_rows, value_input_option="USER_ENTERED")
+        )
 
         # Tüm biçimlendirmeyi TEK bir toplu istekte gönderiyoruz (satır
         # başına ayrı ayrı .format() çağırmak yüzlerce/binlerce API isteğine
@@ -1043,19 +1080,27 @@ def resort_performance_sheet():
 
             if row[9] == "✅":
                 try:
-                    entry_price = float(row[3])
+                    entry_price = _parse_sheet_number(row[3])
+                    if entry_price is None:
+                        raise ValueError("giriş fiyatı okunamadı")
                     target_price = entry_price * 1.05
                     for gi in range(5):
-                        gv = row[4 + gi]
-                        if gv and float(gv) >= target_price:
+                        gv = _parse_sheet_number(row[4 + gi])
+                        if gv is not None and gv >= target_price:
                             col_letter = gspread.utils.rowcol_to_a1(idx, 5 + gi)
                             format_requests.append({"range": col_letter, "format": _FMT_GUN_HEDEF_TUTTU})
+                            # Hedef tutulduktan sonraki günler dümdüz yeşil zemin
+                            for gj in range(gi + 1, 5):
+                                format_requests.append({
+                                    "range": gspread.utils.rowcol_to_a1(idx, 5 + gj),
+                                    "format": _FMT_GUN_HEDEF_SONRASI
+                                })
                             break
                 except Exception:
                     pass
 
         if format_requests:
-            ws.batch_format(format_requests)
+            _sheets_call_with_retry(lambda: ws.batch_format(format_requests))
 
         print(f"[DEBUG resort_performance_sheet] {len(final_rows)} satır tarih+alfabetik sıraya dizildi ({len(format_requests)} biçim tek istekte gönderildi).")
     except Exception as e:
