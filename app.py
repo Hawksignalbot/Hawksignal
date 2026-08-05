@@ -774,7 +774,8 @@ PERFORMANCE_SHEET_HEADER = [
     "Tarih", "Sembol", "Sinyal Tipi", "Giriş Fiyatı",
     "Gün1 Max", "Gün2 Max", "Gün3 Max", "Gün4 Max", "Gün5 Max",
     "Sonuç", "En Düşük", "Max Düşüş %", "Tuttuğu Gün", "Zarar Kes",
-    "Puan", "$ Hacim (M)", "ATR %", "Kaynak"
+    "Puan", "$ Hacim (M)", "ATR %", "Kaynak",
+    "Gün5 Kapanış", "Stopsuz Sonuç %"
 ]
 _gsheet_client_cache = {"client": None, "worksheet": None}
 _last_date_cache = {"date": None}  # {"date": "08.07.2026"} - son yazılan tarih
@@ -1166,6 +1167,19 @@ def update_daily_performance(force=False):
 
             highs = [float(following.iloc[k]["High"]) for k in range(n_gun)]
             lows = [float(following.iloc[k]["Low"]) for k in range(n_gun)]
+            closes = [float(following.iloc[k]["Close"]) for k in range(n_gun)]
+
+            # STOPSUZ SENARYO: hiç zarar kes koymadan, hedefe dokunsa bile
+            # satmadan 5 günün sonuna kadar tutulsaydı sonuç ne olurdu?
+            # Bu, "eninde sonunda toparlar mı" sorusunun tek dürüst cevabı —
+            # çünkü Gün Max sütunları fiyatın o seviyeye DOKUNDUĞUNU söyler,
+            # o seviyede KALDIĞINI değil. Sadece pencere tamamlandığında
+            # (5 gün dolduğunda) hesaplanır.
+            gun5_kapanis = None
+            stopsuz_pct = None
+            if n_gun >= 5:
+                gun5_kapanis = closes[4]
+                stopsuz_pct = (gun5_kapanis - entry_price) / entry_price * 100.0
 
             target = entry_price * 1.05
             stop_fiyat = {th: entry_price * (1 - th / 100.0) for th in STOP_ESIKLERI}
@@ -1243,6 +1257,9 @@ def update_daily_performance(force=False):
                 dokundu = True
             updates.append((i, 13, (hit_gun + 1) if hit_gun is not None else "—"))
             updates.append((i, 14, zarar_kes_metni))
+            if gun5_kapanis is not None:
+                updates.append((i, 19, round(gun5_kapanis, 2)))
+                updates.append((i, 20, f"%{stopsuz_pct:.1f}"))
             dokundu = True
 
             if dokundu:
@@ -3614,6 +3631,7 @@ Bu satırlar "Rastgele (Kıyas)" sinyal tipiyle kaydedildi ve gerçek sinyallerl
             zk = (r[13] or "").strip()
             puan_raw = (r[14] or "").strip() if W > 14 else ""
             hacim_m = _parse_sheet_number(r[15]) if W > 15 else None
+            stopsuz = _parse_sheet_number((r[19] or "").replace("%", "")) if W > 19 else None
             if not sembol or giris is None or sonuc not in ("✅", "🛑", "⛔"):
                 continue  # ⚠️ (anormal) ve henüz kapanmamış satırlar hariç
             puan_val = None
@@ -3622,7 +3640,7 @@ Bu satırlar "Rastgele (Kıyas)" sinyal tipiyle kaydedildi ve gerçek sinyallerl
             kayitlar.append({"tip": tip, "giris": giris, "sonuc": sonuc,
                              "dusus": dusus, "gun": gun, "zk": zk,
                              "puan": puan_val, "puan_raw": puan_raw,
-                             "hacim_m": hacim_m})
+                             "hacim_m": hacim_m, "stopsuz": stopsuz})
 
         if not kayitlar:
             send_telegram("""📊 <b>İSTATİSTİK</b>
@@ -3721,6 +3739,26 @@ Henüz analiz edilebilecek kapanmış satır yok.
                 if g:
                     hacim_satir.append(f"• {ad}: {oran(g)}")
 
+        # STOPSUZ STRATEJİ: hiç zarar kes koymadan 5 gün sonuna kadar
+        # tutulsaydı gerçekte ne olurdu? Gün Max sütunları fiyatın bir seviyeye
+        # DOKUNDUĞUNU gösterir, orada KALDIĞINI değil — bu yüzden "hedefe
+        # ulaşırdı" sayısı elde kalan parayı göstermez. Bu bölüm 5. günün
+        # gerçek KAPANIŞINI kullandığı için tek dürüst cevap budur.
+        stopsuzlar = [k["stopsuz"] for k in kayitlar if k["stopsuz"] is not None]
+        stopsuz_satir = []
+        if len(stopsuzlar) < 10:
+            stopsuz_satir.append(f"• Yeterli veri yok ({len(stopsuzlar)} kayıt). "
+                                 "Sütun yeni eklendi; /performans yenile ile geçmiş hesaplanır.")
+        else:
+            n2 = len(stopsuzlar)
+            artida = sum(1 for x in stopsuzlar if x > 0)
+            ort = sum(stopsuzlar) / n2
+            medyan = sorted(stopsuzlar)[n2 // 2]
+            stopsuz_satir.append(f"• İşlem başına ortalama: <b>%{ort:+.1f}</b>")
+            stopsuz_satir.append(f"• Medyan (ortadaki işlem): %{medyan:+.1f}")
+            stopsuz_satir.append(f"• 5. gün artıda kapatan: {artida}/{n2} (%{artida / n2 * 100:.0f})")
+            stopsuz_satir.append(f"• En iyi: %{max(stopsuzlar):+.1f} · En kötü: %{min(stopsuzlar):+.1f}")
+
         dususler = [k["dusus"] for k in kayitlar if k["dusus"] is not None]
         ort_dusus = f"%{sum(dususler) / len(dususler):.1f}" if dususler else "—"
         en_kotu = f"%{min(dususler):.1f}" if dususler else "—"
@@ -3755,6 +3793,10 @@ Kapanmış işlem: {len(kayitlar)}
 💧 <b>LİKİDİTEYE GÖRE</b>
 (düşük hacimde makas maliyeti kazancı yer)
 {chr(10).join(hacim_satir)}
+──────────────────────────
+🕰️ <b>STOPSUZ STRATEJİ (5 gün sonuna kadar tut)</b>
+(zarar kes yok, hedefte satış yok — 5. gün kapanışı)
+{chr(10).join(stopsuz_satir)}
 ──────────────────────────
 📉 <b>DÜŞÜŞ</b>
 Ortalama max düşüş: {ort_dusus}
