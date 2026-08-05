@@ -3840,15 +3840,34 @@ Henüz analiz edilebilecek kapanmış satır yok.
                 tut = 0
                 for k in olculebilir:
                     hedef_f = k["giris"] * (1 + hp / 100.0)
-                    if any(g is not None and g >= hedef_f for g in k["gunler"]):
-                        tut += 1
+                    # SIRA ÖNEMLİ: zarar kes hedeften ÖNCE tetiklendiyse o
+                    # işlem kazanç sayılamaz — gerçekte zararla çıkmış olurdun
+                    # ve sonraki yükselişi hiç göremezdin. Zarar kesin hangi
+                    # günde kırıldığı "Tuttuğu Gün"/"Zarar Kes" sütunlarından
+                    # değil, Max Düşüş'ün -%5'i aşıp aşmadığından anlaşılır;
+                    # kesin sıra için hedefin tutulduğu günü kullanıyoruz.
+                    hedef_gun = None
+                    for _gi, g in enumerate(k["gunler"]):
+                        if g is not None and g >= hedef_f:
+                            hedef_gun = _gi
+                            break
+                    if hedef_gun is None:
+                        continue
+                    # Zarar kes bu satırda hiç tetiklenmediyse ya da hedef
+                    # ilk gün geldiyse kazanç sayılır; aksi halde kötü senaryo
+                    # (stop önce) varsayılır — ana ölçümle aynı kural.
+                    stoplandi = k["zk"] and k["zk"] != "—"
+                    if stoplandi and hedef_gun > 0:
+                        continue
+                    tut += 1
                 kayip = n3 - tut
                 ev = (tut * hp + kayip * -5.0) / n3
                 hedef_satir.append(
                     f"• <b>+%{hp:.0f}</b> hedef → {tut}/{n3} (%{tut / n3 * 100:.0f}) · "
                     f"İşlem başına <b>%{ev:+.1f}</b>")
-            hedef_satir.append("<i>Zarar kes -%5 sabit varsayıldı. Tutmayan her "
-                               "işlem -%5 kabul edilir.</i>")
+            hedef_satir.append("<i>Zarar kes -%5 varsayıldı. Zarar kes hedeften "
+                               "önce tetiklenmişse kazanç sayılmaz (kötü senaryo) — "
+                               "ana ölçümle aynı kural.</i>")
 
         # FIBONACCI 0,236 — dört pencerede paralel. Hangi geriye bakış
         # penceresinin daha iyi sonuç verdiğine veri karar verir.
