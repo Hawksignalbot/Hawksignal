@@ -292,10 +292,45 @@ def _mesaji_parcala(message, limit=TELEGRAM_MAX_LEN):
     return parcalar
 
 
+def _etiketleri_dengele(parcalar):
+    """
+    Bölünmüş parçalardaki HTML etiketlerini dengeler.
+
+    Sorun: <i>...</i> gibi BİRDEN FAZLA SATIRA yayılan bir etiket, bölme
+    noktasına denk geldiğinde bir parça açık etiketle biter, sonraki parça
+    kapanış etiketiyle başlar. Telegram bunu geçersiz sayıp 400 döner ve
+    mesaj düz metin olarak gönderilir — kullanıcı ham <b> etiketlerini görür.
+
+    Çözüm: her parçanın sonunda açık kalan etiketler kapatılır, sonraki
+    parçanın başında yeniden açılır.
+    """
+    KAPSANAN = ("b", "i", "u", "s", "code", "pre")
+    sonuc, devreden = [], []
+    for parca in parcalar:
+        govde = ("".join(f"<{e}>" for e in devreden)) + parca
+        # Açık kalan etiketleri sırayla takip et
+        acik = []
+        for m in re.finditer(r"<(/?)([a-zA-Z]+)[^>]*>", govde):
+            kapali, ad = m.group(1) == "/", m.group(2).lower()
+            if ad not in KAPSANAN:
+                continue
+            if kapali:
+                if acik and acik[-1] == ad:
+                    acik.pop()
+                elif ad in acik:
+                    acik.remove(ad)
+            else:
+                acik.append(ad)
+        govde += "".join(f"</{e}>" for e in reversed(acik))
+        sonuc.append(govde)
+        devreden = list(acik)
+    return sonuc
+
+
 def send_telegram(message, chat_id=None, thread_id=None):
     cid = chat_id or CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    parcalar = _mesaji_parcala(message)
+    parcalar = _etiketleri_dengele(_mesaji_parcala(message))
     toplam = len(parcalar)
     for sira, parca in enumerate(parcalar, start=1):
         metin = parca if toplam == 1 else f"{parca}\n\n— {sira}/{toplam} —"
