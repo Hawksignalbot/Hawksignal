@@ -775,7 +775,8 @@ PERFORMANCE_SHEET_HEADER = [
     "Gün1 Max", "Gün2 Max", "Gün3 Max", "Gün4 Max", "Gün5 Max",
     "Sonuç", "En Düşük", "Max Düşüş %", "Tuttuğu Gün", "Zarar Kes",
     "Puan", "$ Hacim (M)", "ATR %", "Kaynak",
-    "Gün5 Kapanış", "Stopsuz Sonuç %"
+    "Gün5 Kapanış", "Stopsuz Sonuç %",
+    "Fibo 0.236", "Fibo Hedef %", "Fibo Sonuç"
 ]
 _gsheet_client_cache = {"client": None, "worksheet": None}
 _last_date_cache = {"date": None}  # {"date": "08.07.2026"} - son yazılan tarih
@@ -1175,6 +1176,44 @@ def update_daily_performance(force=False):
             # çünkü Gün Max sütunları fiyatın o seviyeye DOKUNDUĞUNU söyler,
             # o seviyede KALDIĞINI değil. Sadece pencere tamamlandığında
             # (5 gün dolduğunda) hesaplanır.
+            # FIBONACCI 0,236 HEDEFİ
+            # Mantık: hisse önceki bir TEPE'den düşmüş, girişten önce bir DİP
+            # yapmış. Fibonacci düzeltmesi, bu düşüşün ne kadarının geri
+            # alınacağını tahmin eder. 0,236 en sığ (en kolay ulaşılan) seviye.
+            #
+            # Hedef = dip + 0,236 × (tepe - dip)
+            #
+            # ÖNEMLİ: Bu sabit bir yüzde DEĞİLDİR. Her hissede tepe-dip
+            # aralığına göre farklı bir yüzdeye denk gelir — bu yüzden ayrıca
+            # "Fibo Hedef %" sütununda girişe göre kaç yüzde ettiği yazılır.
+            # Sabit %2/%3 hedefiyle karıştırılmaması için ayrı ölçülür.
+            fibo_hedef = None
+            fibo_hedef_pct = None
+            fibo_sonuc = ""
+            try:
+                # Girişten önceki 60 barlık pencerede tepe ve sonrasındaki dip
+                gecmis_bas = max(0, matches[0] - 60)
+                gecmis = df.iloc[gecmis_bas: matches[0] + 1]
+                if len(gecmis) >= 10:
+                    tepe_idx = int(gecmis["High"].values.argmax())
+                    tepe = float(gecmis["High"].values[tepe_idx])
+                    # Tepeden SONRAKİ en düşük nokta (düzeltmenin dibi)
+                    sonrasi = gecmis.iloc[tepe_idx:]
+                    dip = float(sonrasi["Low"].min())
+                    if tepe > dip > 0:
+                        fibo_hedef = dip + 0.236 * (tepe - dip)
+                        fibo_hedef_pct = (fibo_hedef - entry_price) / entry_price * 100.0
+                        if fibo_hedef <= entry_price:
+                            # Giriş zaten 0,236'nın üstünde — bu kurulum
+                            # Fibonacci mantığına uygun değil
+                            fibo_sonuc = "n/a"
+                        elif any(h >= fibo_hedef for h in highs):
+                            fibo_sonuc = "✅"
+                        elif n_gun >= 5:
+                            fibo_sonuc = "⛔"
+            except Exception as e:
+                print(f"[DEBUG fibo] {symbol}: {e}")
+
             gun5_kapanis = None
             stopsuz_pct = None
             if n_gun >= 5:
@@ -1260,6 +1299,11 @@ def update_daily_performance(force=False):
             if gun5_kapanis is not None:
                 updates.append((i, 19, round(gun5_kapanis, 2)))
                 updates.append((i, 20, f"%{stopsuz_pct:.1f}"))
+            if fibo_hedef is not None:
+                updates.append((i, 21, round(fibo_hedef, 4)))
+                updates.append((i, 22, f"%{fibo_hedef_pct:.1f}"))
+                if fibo_sonuc:
+                    updates.append((i, 23, fibo_sonuc))
             dokundu = True
 
             if dokundu:
@@ -3632,6 +3676,9 @@ Bu satırlar "Rastgele (Kıyas)" sinyal tipiyle kaydedildi ve gerçek sinyallerl
             puan_raw = (r[14] or "").strip() if W > 14 else ""
             hacim_m = _parse_sheet_number(r[15]) if W > 15 else None
             stopsuz = _parse_sheet_number((r[19] or "").replace("%", "")) if W > 19 else None
+            gunler = [_parse_sheet_number(r[4 + z]) for z in range(5)]
+            fibo_pct = _parse_sheet_number((r[21] or "").replace("%", "")) if W > 21 else None
+            fibo_sonuc = (r[22] or "").strip() if W > 22 else ""
             if not sembol or giris is None or sonuc not in ("✅", "🛑", "⛔"):
                 continue  # ⚠️ (anormal) ve henüz kapanmamış satırlar hariç
             puan_val = None
@@ -3640,7 +3687,9 @@ Bu satırlar "Rastgele (Kıyas)" sinyal tipiyle kaydedildi ve gerçek sinyallerl
             kayitlar.append({"tip": tip, "giris": giris, "sonuc": sonuc,
                              "dusus": dusus, "gun": gun, "zk": zk,
                              "puan": puan_val, "puan_raw": puan_raw,
-                             "hacim_m": hacim_m, "stopsuz": stopsuz})
+                             "hacim_m": hacim_m, "stopsuz": stopsuz,
+                             "gunler": gunler, "fibo_pct": fibo_pct,
+                             "fibo_sonuc": fibo_sonuc})
 
         if not kayitlar:
             send_telegram("""📊 <b>İSTATİSTİK</b>
@@ -3759,6 +3808,50 @@ Henüz analiz edilebilecek kapanmış satır yok.
             stopsuz_satir.append(f"• 5. gün artıda kapatan: {artida}/{n2} (%{artida / n2 * 100:.0f})")
             stopsuz_satir.append(f"• En iyi: %{max(stopsuzlar):+.1f} · En kötü: %{min(stopsuzlar):+.1f}")
 
+        # FARKLI HEDEF SEVİYELERİ
+        # Küçük hedef = yüksek isabet ama küçük kazanç. Hangi dengenin
+        # daha iyi olduğunu görmek için aynı satırlar farklı hedeflerle
+        # yeniden değerlendirilir. Zarar kes -%5 sabit tutulur.
+        hedef_satir = []
+        olculebilir = [k for k in kayitlar if any(g is not None for g in k["gunler"])]
+        if len(olculebilir) < 10:
+            hedef_satir.append(f"• Yeterli veri yok ({len(olculebilir)} kayıt).")
+        else:
+            for hp in (2.0, 3.0, 5.0, 10.0):
+                n3 = len(olculebilir)
+                tut = 0
+                for k in olculebilir:
+                    hedef_f = k["giris"] * (1 + hp / 100.0)
+                    if any(g is not None and g >= hedef_f for g in k["gunler"]):
+                        tut += 1
+                kayip = n3 - tut
+                ev = (tut * hp + kayip * -5.0) / n3
+                hedef_satir.append(
+                    f"• <b>+%{hp:.0f}</b> hedef → {tut}/{n3} (%{tut / n3 * 100:.0f}) · "
+                    f"İşlem başına <b>%{ev:+.1f}</b>")
+            hedef_satir.append("<i>Zarar kes -%5 sabit varsayıldı. Tutmayan her "
+                               "işlem -%5 kabul edilir.</i>")
+
+        # FIBONACCI 0,236 — sabit yüzdeden farklı olarak her hissenin kendi
+        # tepe-dip aralığına göre hesaplanır.
+        fibo_satir = []
+        fibolu = [k for k in kayitlar if k["fibo_sonuc"] in ("✅", "⛔")]
+        if len(fibolu) < 10:
+            fibo_satir.append(f"• Yeterli veri yok ({len(fibolu)} kayıt). "
+                              "/performans yenile ile geçmiş hesaplanır.")
+        else:
+            n4 = len(fibolu)
+            tut4 = sum(1 for k in fibolu if k["fibo_sonuc"] == "✅")
+            pctler = [k["fibo_pct"] for k in fibolu if k["fibo_pct"] is not None]
+            ort_hedef = sum(pctler) / len(pctler) if pctler else 0
+            ev4 = (tut4 * ort_hedef + (n4 - tut4) * -5.0) / n4
+            fibo_satir.append(f"• İsabet: {tut4}/{n4} (%{tut4 / n4 * 100:.0f})")
+            fibo_satir.append(f"• Ortalama hedef büyüklüğü: %{ort_hedef:+.1f}")
+            fibo_satir.append(f"• İşlem başına (zarar kes -%5): <b>%{ev4:+.1f}</b>")
+            uygunsuz = sum(1 for k in kayitlar if k["fibo_sonuc"] == "n/a")
+            if uygunsuz:
+                fibo_satir.append(f"• Kurulum uygun değil (giriş zaten 0,236 üstünde): {uygunsuz}")
+
         dususler = [k["dusus"] for k in kayitlar if k["dusus"] is not None]
         ort_dusus = f"%{sum(dususler) / len(dususler):.1f}" if dususler else "—"
         en_kotu = f"%{min(dususler):.1f}" if dususler else "—"
@@ -3793,6 +3886,14 @@ Kapanmış işlem: {len(kayitlar)}
 💧 <b>LİKİDİTEYE GÖRE</b>
 (düşük hacimde makas maliyeti kazancı yer)
 {chr(10).join(hacim_satir)}
+──────────────────────────
+🎯 <b>FARKLI HEDEF SEVİYELERİ</b>
+(küçük hedef = yüksek isabet, küçük kazanç)
+{chr(10).join(hedef_satir)}
+──────────────────────────
+📐 <b>FIBONACCI 0,236 HEDEFİ</b>
+(her hissenin kendi tepe-dip aralığına göre)
+{chr(10).join(fibo_satir)}
 ──────────────────────────
 🕰️ <b>STOPSUZ STRATEJİ (5 gün sonuna kadar tut)</b>
 (zarar kes yok, hedefte satış yok — 5. gün kapanışı)
