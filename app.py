@@ -347,7 +347,11 @@ def send_telegram(message, chat_id=None, thread_id=None):
                 # HTML ayrıştırma hatasında düz metin olarak tekrar dene —
                 # mesajın hiç ulaşmamasından iyidir.
                 if r.status_code == 400:
+                    # HTML ayrıştırma hatası: parse_mode'u kaldırıp tekrar
+                    # deniyoruz. ÖNEMLİ: etiketleri metinden de TEMİZLİYORUZ —
+                    # aksi halde kullanıcı ham <b> etiketlerini görüyor.
                     payload.pop("parse_mode", None)
+                    payload["text"] = re.sub(r"</?[a-zA-Z][^>]*>", "", payload["text"])
                     try:
                         requests.post(url, json=payload, timeout=10)
                     except Exception:
@@ -3857,12 +3861,23 @@ Henüz analiz edilebilecek kapanmış satır yok.
             _hic = False
             n4 = len(grup)
             tut4 = sum(1 for k in grup if k["fibo_map"][_pen] == "✅")
-            pctler = [k["fibo_pct"] for k in grup if k["fibo_pct"] is not None]
-            ort_hedef = sum(pctler) / len(pctler) if pctler else 0
-            ev4 = (tut4 * ort_hedef + (n4 - tut4) * -5.0) / n4
+            # Hedef büyüklüğünde ORTALAMA yerine MEDYAN kullanıyoruz.
+            # Bölünme/veri hatası olan satırlarda hedef %600.000 gibi saçma
+            # değerlere çıkabiliyor ve tek bir satır ortalamayı (dolayısıyla
+            # "işlem başına sonuç" hesabını) tamamen bozuyordu.
+            # Ayrıca gerçekçi olmayan hedefler (>%30) hesaba katılmıyor.
+            pctler = sorted(k["fibo_pct"] for k in grup
+                            if k["fibo_pct"] is not None and 0 < k["fibo_pct"] <= 30)
+            if len(pctler) < 5:
+                fibo_satir.append(
+                    f"• <b>{_pen} bar</b> → {tut4}/{n4} (%{tut4 / n4 * 100:.0f}) · "
+                    f"hedef büyüklüğü ölçülemedi (veri bozuk)")
+                continue
+            med_hedef = pctler[len(pctler) // 2]
+            ev4 = (tut4 * med_hedef + (n4 - tut4) * -5.0) / n4
             fibo_satir.append(
                 f"• <b>{_pen} bar</b> → {tut4}/{n4} (%{tut4 / n4 * 100:.0f}) · "
-                f"ort. hedef %{ort_hedef:+.1f} · işlem başına <b>%{ev4:+.1f}</b>")
+                f"medyan hedef %{med_hedef:+.1f} · işlem başına <b>%{ev4:+.1f}</b>")
         if _hic:
             fibo_satir.append("• Yeterli veri yok. /performans yenile ile geçmiş hesaplanır.")
         else:
