@@ -3869,34 +3869,33 @@ Henüz analiz edilebilecek kapanmış satır yok.
                                "önce tetiklenmişse kazanç sayılmaz (kötü senaryo) — "
                                "ana ölçümle aynı kural.</i>")
 
-        # FIBONACCI 0,236 — dört pencerede paralel. Hangi geriye bakış
-        # penceresinin daha iyi sonuç verdiğine veri karar verir.
+        # FIBONACCI 0,236 — dört pencerede paralel.
+        # ÖNEMLİ: Çıkış hedefi Fibonacci seviyesinin KENDİSİDİR; sabit bir
+        # yüzde değil. Bu seviye kimi hissede %3, kimisinde %40 edebilir.
+        # Bu yüzden her satır KENDİ hedef yüzdesiyle hesaplanır — hepsine
+        # ortak bir medyan uygulamak, büyük kazançları görünmez yapardı.
+        # Üst sınır olarak sadece açıkça bozuk veriyi (%200 üstü) eliyoruz.
         fibo_satir = []
         _hic = True
         for _pen in (20, 40, 60, 120):
-            grup = [k for k in kayitlar if k["fibo_map"].get(_pen) in ("✅", "⛔")]
+            grup = [k for k in kayitlar
+                    if k["fibo_map"].get(_pen) in ("✅", "⛔")
+                    and k["fibo_pct"] is not None and 0 < k["fibo_pct"] <= 200]
             if len(grup) < 10:
                 continue
             _hic = False
             n4 = len(grup)
             tut4 = sum(1 for k in grup if k["fibo_map"][_pen] == "✅")
-            # Hedef büyüklüğünde ORTALAMA yerine MEDYAN kullanıyoruz.
-            # Bölünme/veri hatası olan satırlarda hedef %600.000 gibi saçma
-            # değerlere çıkabiliyor ve tek bir satır ortalamayı (dolayısıyla
-            # "işlem başına sonuç" hesabını) tamamen bozuyordu.
-            # Ayrıca gerçekçi olmayan hedefler (>%30) hesaba katılmıyor.
-            pctler = sorted(k["fibo_pct"] for k in grup
-                            if k["fibo_pct"] is not None and 0 < k["fibo_pct"] <= 30)
-            if len(pctler) < 5:
-                fibo_satir.append(
-                    f"• <b>{_pen} bar</b> → {tut4}/{n4} (%{tut4 / n4 * 100:.0f}) · "
-                    f"hedef büyüklüğü ölçülemedi (veri bozuk)")
-                continue
-            med_hedef = pctler[len(pctler) // 2]
-            ev4 = (tut4 * med_hedef + (n4 - tut4) * -5.0) / n4
+            # Her satır kendi hedefiyle: tuttuysa +kendi hedefi, tutmadıysa -%5
+            toplam = sum((k["fibo_pct"] if k["fibo_map"][_pen] == "✅" else -5.0)
+                         for k in grup)
+            ev4 = toplam / n4
+            kazanc_ort = ([k["fibo_pct"] for k in grup if k["fibo_map"][_pen] == "✅"] or [0])
+            ort_kazanc = sum(kazanc_ort) / len(kazanc_ort)
             fibo_satir.append(
                 f"• <b>{_pen} bar</b> → {tut4}/{n4} (%{tut4 / n4 * 100:.0f}) · "
-                f"medyan hedef %{med_hedef:+.1f} · işlem başına <b>%{ev4:+.1f}</b>")
+                f"tutanların ort. kazancı %{ort_kazanc:+.1f} · "
+                f"işlem başına <b>%{ev4:+.1f}</b>")
         if _hic:
             fibo_satir.append("• Yeterli veri yok. /performans yenile ile geçmiş hesaplanır.")
         else:
@@ -3904,8 +3903,37 @@ Henüz analiz edilebilecek kapanmış satır yok.
                             if any(v == "n/a" for v in k["fibo_map"].values()))
             if _uygunsuz:
                 fibo_satir.append(f"• Kurulum uygun değil (giriş zaten 0,236 üstünde): {_uygunsuz}")
-            fibo_satir.append("<i>Tepe = salınım tepesi (yerel zirve). "
-                              "Zarar kes -%5 varsayıldı.</i>")
+            fibo_satir.append("<i>Çıkış = Fibonacci seviyesinin kendisi (sabit yüzde değil). "
+                              "Zarar kes -%5. Hedefi %200 üstü çıkan bozuk satırlar hariç.</i>")
+
+        # ASİMETRİK KURGU: kazanç hedefi zarar kesten BÜYÜK olursa ne olur?
+        # %5 hedef / %5 stop kurgusunda kâr için isabet oranının %50'yi
+        # geçmesi gerekir — hiçbir yöntem bunu sağlamadı. Kazancı büyütmek
+        # düşük isabetle de kâr etmeyi mümkün kılar. Bu bölüm onu ölçer.
+        rr_satir = []
+        rr_olcu = [k for k in kayitlar if any(g is not None for g in k["gunler"])]
+        if len(rr_olcu) < 10:
+            rr_satir.append(f"• Yeterli veri yok ({len(rr_olcu)} kayıt).")
+        else:
+            nr = len(rr_olcu)
+            for hedef_p, stop_p in ((10.0, 5.0), (15.0, 5.0), (20.0, 5.0),
+                                    (15.0, 7.0), (30.0, 10.0)):
+                tut_r = 0
+                for k in rr_olcu:
+                    hf = k["giris"] * (1 + hedef_p / 100.0)
+                    ulasti = any(g is not None and g >= hf for g in k["gunler"])
+                    # Stop hedeften önce kırıldıysa kazanç sayılmaz
+                    dusus = k["dusus"] if k["dusus"] is not None else 0
+                    if ulasti and not (dusus <= -stop_p):
+                        tut_r += 1
+                ev_r = (tut_r * hedef_p + (nr - tut_r) * -stop_p) / nr
+                gerekli = stop_p / (hedef_p + stop_p) * 100
+                rr_satir.append(
+                    f"• <b>+%{hedef_p:.0f} / -%{stop_p:.0f}</b> → {tut_r}/{nr} "
+                    f"(%{tut_r / nr * 100:.0f}) · başabaş için gereken %{gerekli:.0f} · "
+                    f"işlem başına <b>%{ev_r:+.1f}</b>")
+            rr_satir.append("<i>Kazanç hedefi büyüdükçe başabaş için gereken isabet "
+                            "oranı düşer. İşlem başına sonuç pozitifse o kurgu kârlıdır.</i>")
 
         dususler = [k["dusus"] for k in kayitlar if k["dusus"] is not None]
         ort_dusus = f"%{sum(dususler) / len(dususler):.1f}" if dususler else "—"
@@ -3949,6 +3977,9 @@ Kapanmış işlem: {len(kayitlar)}
 📐 <b>FIBONACCI 0,236 — GERİYE BAKIŞ PENCERESİ</b>
 (her hissenin kendi tepe-dip aralığına göre)
 {chr(10).join(fibo_satir)}
+──────────────────────────
+⚖️ <b>ASİMETRİK KURGU (kazanç > kayıp)</b>
+{chr(10).join(rr_satir)}
 ──────────────────────────
 🕰️ <b>STOPSUZ STRATEJİ (5 gün sonuna kadar tut)</b>
 (zarar kes yok, hedefte satış yok — 5. gün kapanışı)
