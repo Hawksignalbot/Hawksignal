@@ -3890,12 +3890,31 @@ Henüz analiz edilebilecek kapanmış satır yok.
             toplam = sum((k["fibo_pct"] if k["fibo_map"][_pen] == "✅" else -5.0)
                          for k in grup)
             ev4 = toplam / n4
-            kazanc_ort = ([k["fibo_pct"] for k in grup if k["fibo_map"][_pen] == "✅"] or [0])
-            ort_kazanc = sum(kazanc_ort) / len(kazanc_ort)
+            kazanclar = sorted(k["fibo_pct"] for k in grup if k["fibo_map"][_pen] == "✅")
+            if not kazanclar:
+                kazanclar = [0.0]
+            ort_kazanc = sum(kazanclar) / len(kazanclar)
+            med_kazanc = kazanclar[len(kazanclar) // 2]
+
+            # DAYANIKLILIK TESTİ
+            # Bir stratejinin sonucu birkaç büyük kazanca dayanıyorsa, o
+            # sonuç tekrarlanabilir değildir — bir sonraki dönemde o uç
+            # değerler çıkmayabilir. En büyük 3 kazancı çıkarıp sonucun
+            # hâlâ pozitif kalıp kalmadığına bakıyoruz. Ayakta kalırsa
+            # etki geniş tabana yayılmış demektir.
+            if len(kazanclar) > 3:
+                kirpik = kazanclar[:-3]
+                kayip_sayisi = n4 - tut4
+                ev_kirpik = (sum(kirpik) + (kayip_sayisi + 3) * -5.0) / n4
+                kirpik_metni = f"en büyük 3 kazanç çıkarılınca %{ev_kirpik:+.1f}"
+            else:
+                kirpik_metni = "kırpma testi için yeterli kazanç yok"
+
             fibo_satir.append(
                 f"• <b>{_pen} bar</b> → {tut4}/{n4} (%{tut4 / n4 * 100:.0f}) · "
-                f"tutanların ort. kazancı %{ort_kazanc:+.1f} · "
-                f"işlem başına <b>%{ev4:+.1f}</b>")
+                f"işlem başına <b>%{ev4:+.1f}</b>\n"
+                f"   kazançlar: ort %{ort_kazanc:+.1f} / medyan %{med_kazanc:+.1f} · "
+                f"{kirpik_metni}")
         if _hic:
             fibo_satir.append("• Yeterli veri yok. /performans yenile ile geçmiş hesaplanır.")
         else:
@@ -3904,7 +3923,9 @@ Henüz analiz edilebilecek kapanmış satır yok.
             if _uygunsuz:
                 fibo_satir.append(f"• Kurulum uygun değil (giriş zaten 0,236 üstünde): {_uygunsuz}")
             fibo_satir.append("<i>Çıkış = Fibonacci seviyesinin kendisi (sabit yüzde değil). "
-                              "Zarar kes -%5. Hedefi %200 üstü çıkan bozuk satırlar hariç.</i>")
+                              "Zarar kes -%5. Ortalama ile medyan arasındaki fark büyükse "
+                              "sonucu birkaç uç kazanç taşıyor demektir; kırpma testi bunu "
+                              "doğrudan sınar.</i>")
 
         # ASİMETRİK KURGU: kazanç hedefi zarar kesten BÜYÜK olursa ne olur?
         # %5 hedef / %5 stop kurgusunda kâr için isabet oranının %50'yi
